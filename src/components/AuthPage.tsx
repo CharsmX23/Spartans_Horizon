@@ -1,5 +1,5 @@
 import { useState, FormEvent } from 'react';
-import { Mail, Lock, LogIn, UserPlus, Loader2, ShieldCheck } from 'lucide-react';
+import { AtSign, Lock, LogIn, UserPlus, Loader2, ShieldCheck } from 'lucide-react';
 import { useAuth } from '../lib/auth';
 
 type Mode = 'signin' | 'signup';
@@ -7,18 +7,18 @@ type Mode = 'signin' | 'signup';
 export default function AuthPage() {
   const { signIn, signUp } = useAuth();
   const [mode, setMode] = useState<Mode>('signin');
-  const [email, setEmail] = useState('');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!email.trim() || !password) return;
+    if (!username.trim() || !password) return;
     setSubmitting(true);
     setError(null);
     const fn = mode === 'signin' ? signIn : signUp;
-    const { error } = await fn(email.trim(), password);
+    const { error } = await fn(username, password);
     setSubmitting(false);
     if (error) {
       setError(error);
@@ -96,19 +96,26 @@ export default function AuthPage() {
 
           <form onSubmit={handleSubmit} className="flex flex-col gap-4">
             <div>
-              <label className="text-[11px] text-white/50 font-semibold mb-1.5 block">EMAIL</label>
+              <label className="text-[11px] text-white/50 font-semibold mb-1.5 block">USERNAME</label>
               <div className="relative">
-                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/35" />
+                <AtSign className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/35" />
                 <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="you@domain.com"
-                  autoComplete="email"
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="spartan_01"
+                  autoComplete="username"
+                  autoCapitalize="none"
+                  spellCheck={false}
                   required
                   className="w-full bg-white/5 border border-white/10 rounded-xl pl-10 pr-3 py-2.5 text-sm text-white placeholder:text-white/30 outline-none focus:border-white/25 transition"
                 />
               </div>
+              {mode === 'signup' && (
+                <p className="text-[10px] text-white/30 mt-1.5">
+                  3–20 characters — lowercase letters, numbers, underscore.
+                </p>
+              )}
             </div>
 
             <div>
@@ -136,7 +143,7 @@ export default function AuthPage() {
 
             <button
               type="submit"
-              disabled={submitting || !email.trim() || password.length < 6}
+              disabled={submitting || !username.trim() || password.length < 6}
               className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
               style={{ background: 'var(--accent)', boxShadow: '0 8px 24px -8px var(--accent)' }}
             >

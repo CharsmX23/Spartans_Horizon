@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import TopBar from './components/TopBar';
 import Sidebar, { TabKey } from './components/Sidebar';
 import MissionHero from './components/MissionHero';
@@ -11,7 +11,8 @@ import JournalPage from './components/JournalPage';
 import PowerUpPage from './components/PowerUpPage';
 import GoalsPage from './components/GoalsPage';
 import AuthPage from './components/AuthPage';
-import { getCurrentUser } from './data';
+import SquadGate from './components/SquadGate';
+import { getCurrentUser, Person } from './data';
 import { ACCENTS, AccentKey, applyAccent } from './theme';
 import { AuthProvider, useAuth } from './lib/auth';
 
@@ -24,27 +25,59 @@ function App() {
 }
 
 function AppShell() {
-  const { session, loading } = useAuth();
-  const [user, setUser] = useState(getCurrentUser());
+  const { session, profile, profileReady, loading, signOut } = useAuth();
+  const [accent, setAccent] = useState<AccentKey>(() => getCurrentUser().accent);
   const [tab, setTab] = useState<TabKey>('mission');
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
-    applyAccent(ACCENTS[user.accent].hex);
-  }, [user.accent]);
+    applyAccent(ACCENTS[accent].hex);
+  }, [accent]);
 
-  const pickAccent = (k: AccentKey) => setUser((u) => ({ ...u, accent: k }));
+  // Identity comes from the profile row; level/avatar are still demo data from
+  // data.ts until those features land.
+  const user: Person = useMemo(() => {
+    const demo = getCurrentUser();
+    if (!profile) return { ...demo, accent };
+    return {
+      ...demo,
+      id: profile.id,
+      name: profile.username,
+      handle: `@${profile.username}`,
+      streak: profile.current_streak,
+      accent,
+    };
+  }, [profile, accent]);
 
   if (loading) {
-    return (
-      <div className="h-screen grid place-items-center bg-ink text-white/40">
-        <div className="text-sm">Loading…</div>
-      </div>
-    );
+    return <FullScreenMessage>Loading…</FullScreenMessage>;
   }
 
   if (!session) {
     return <AuthPage />;
+  }
+
+  if (!profileReady) {
+    return <FullScreenMessage>Loading your profile…</FullScreenMessage>;
+  }
+
+  if (!profile) {
+    // The signup trigger should make this unreachable; if it isn't, say so rather
+    // than spinning forever.
+    return (
+      <FullScreenMessage>
+        <div className="text-center">
+          <p>This account has no profile row.</p>
+          <button onClick={() => signOut()} className="mt-3 text-white/70 underline underline-offset-2">
+            Sign out
+          </button>
+        </div>
+      </FullScreenMessage>
+    );
+  }
+
+  if (!profile.squad_id) {
+    return <SquadGate />;
   }
 
   return (
@@ -93,8 +126,16 @@ function AppShell() {
         user={user}
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
-        onPick={pickAccent}
+        onPick={setAccent}
       />
+    </div>
+  );
+}
+
+function FullScreenMessage({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="h-screen grid place-items-center bg-ink text-white/40">
+      <div className="text-sm">{children}</div>
     </div>
   );
 }

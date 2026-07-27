@@ -30,6 +30,7 @@ export default function JournalPage() {
   const [isFlipping, setIsFlipping] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   // Form state
   const [fTitle, setFTitle] = useState('');
@@ -42,10 +43,11 @@ export default function JournalPage() {
 
   async function loadEntries() {
     setLoading(true);
-    const { data } = await supabase
+    const { data, error: loadError } = await supabase
       .from('journal_entries')
       .select('*')
       .order('created_at', { ascending: false });
+    if (loadError) setError(loadError.message);
     if (data) {
       setEntries(data as Entry[]);
       if (data.length > 0 && !selected) {
@@ -84,13 +86,15 @@ export default function JournalPage() {
   async function saveEntry() {
     if (!fTitle.trim()) return;
     setSaving(true);
+    setError(null);
     try {
       if (mode === 'new') {
-        const { data } = await supabase
+        const { data, error: insertError } = await supabase
           .from('journal_entries')
           .insert({ title: fTitle.trim(), content: fContent, category: fCategory })
           .select('*')
           .single();
+        if (insertError) { setError(insertError.message); return; }
         if (data) {
           const e = data as Entry;
           setEntries(prev => [e, ...prev]);
@@ -98,10 +102,11 @@ export default function JournalPage() {
           setMode('view');
         }
       } else if (mode === 'edit' && selected) {
-        await supabase
+        const { error: updateError } = await supabase
           .from('journal_entries')
           .update({ title: fTitle.trim(), content: fContent, category: fCategory })
           .eq('id', selected.id);
+        if (updateError) { setError(updateError.message); return; }
         const updated = { ...selected, title: fTitle.trim(), content: fContent, category: fCategory };
         setEntries(prev => prev.map(e => e.id === selected.id ? updated : e));
         flip(() => setSelected(updated));
@@ -112,7 +117,14 @@ export default function JournalPage() {
 
   async function deleteEntry() {
     if (!selected) return;
-    await supabase.from('journal_entries').delete().eq('id', selected.id);
+    // Entries are not recoverable — the table has no soft-delete.
+    if (!confirm(`Delete "${selected.title}"? This cannot be undone.`)) return;
+    setError(null);
+    const { error: deleteError } = await supabase
+      .from('journal_entries')
+      .delete()
+      .eq('id', selected.id);
+    if (deleteError) { setError(deleteError.message); return; }
     const remaining = entries.filter(e => e.id !== selected.id);
     setEntries(remaining);
     flip(() => setSelected(remaining[0] ?? null));
@@ -267,13 +279,29 @@ export default function JournalPage() {
                 >
                   <Save className="w-3.5 h-3.5" />{saving ? 'Saving…' : 'Save'}
                 </button>
-                <button onClick={() => { setMode(selected ? 'view' : 'view'); }} style={{ width: 28, height: 28, display: 'grid', placeItems: 'center', borderRadius: 7, background: 'rgba(0,0,0,0.06)', border: '1px solid rgba(0,0,0,0.10)', cursor: 'pointer', color: '#6b5e4e' }}>
+                <button onClick={() => { setMode('view'); setError(null); }} style={{ width: 28, height: 28, display: 'grid', placeItems: 'center', borderRadius: 7, background: 'rgba(0,0,0,0.06)', border: '1px solid rgba(0,0,0,0.10)', cursor: 'pointer', color: '#6b5e4e' }}>
                   <X className="w-3.5 h-3.5" />
                 </button>
               </>
             )}
           </div>
         </div>
+
+        {error && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0,
+            padding: '8px 28px', fontSize: 12, color: '#8c2f22',
+            background: 'rgba(192,57,43,0.10)', borderBottom: '1px solid rgba(192,57,43,0.25)',
+          }}>
+            <span style={{ flex: 1 }}>{error}</span>
+            <button
+              onClick={() => setError(null)}
+              style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#8c2f22', padding: 0 }}
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* Page content — animated on flip */}
         <div

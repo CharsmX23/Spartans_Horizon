@@ -11,7 +11,7 @@ interface Props {
 }
 
 export default function SettingsPanel({ user, open, onClose, onPick }: Props) {
-  const { signOut, user: authUser } = useAuth();
+  const { signOut, squad } = useAuth();
   if (!open) return null;
 
   async function handleSignOut() {
@@ -34,11 +34,23 @@ export default function SettingsPanel({ user, open, onClose, onPick }: Props) {
           <div className="min-w-0">
             <div className="text-white font-semibold">{user.name}</div>
             <div className="text-xs text-white/45 truncate">Lv.{user.level} · {user.handle}</div>
-            {authUser?.email && (
-              <div className="text-[10px] text-white/35 truncate mt-0.5">{authUser.email}</div>
-            )}
           </div>
         </div>
+
+        {squad && (
+          <>
+            <div className="mb-2 text-[11px] tracked-sm text-white/50">SQUAD</div>
+            <div className="flex items-center gap-3 mb-5 p-3 rounded-xl bg-white/[0.03] border border-white/10">
+              <div className="min-w-0 flex-1">
+                <div className="text-white text-sm font-semibold truncate">{squad.name}</div>
+                <div className="text-[11px] text-white/40 mt-0.5">Share this code to invite squadmates</div>
+              </div>
+              <span className="font-mono text-sm tracking-[0.2em] px-2.5 py-1 rounded-lg bg-white/5 border border-white/10 text-white/80">
+                {squad.join_code}
+              </span>
+            </div>
+          </>
+        )}
 
         <div className="mb-2 text-[11px] tracked-sm text-white/50">ACCENT THEME</div>
         <p className="text-[12px] text-white/45 mb-3">Pick a cosmic preset. Everything re-themes instantly.</p>

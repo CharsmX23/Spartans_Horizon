@@ -1,11 +1,9 @@
-import { Home, Rocket, Flame, BookOpen, Target } from 'lucide-react';
+import { Home, Flame, Target } from 'lucide-react';
 import { TabKey } from './Sidebar';
 
 const ITEMS: { key: TabKey; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { key: 'mission',  label: 'Mission', icon: Home },
-  { key: 'startup',  label: 'Ideas',   icon: Rocket },
   { key: 'streaks',  label: 'Streaks', icon: Flame },
-  { key: 'journal',  label: 'Journal', icon: BookOpen },
   { key: 'goals',    label: 'Goals',   icon: Target },
 ];
 

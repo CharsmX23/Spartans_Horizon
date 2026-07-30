@@ -3,14 +3,14 @@ import TopBar from './components/TopBar';
 import Sidebar, { TabKey } from './components/Sidebar';
 import MissionHero from './components/MissionHero';
 import RightSidebar from './components/RightSidebar';
-import { NextMissions, StartupIdeas } from './components/LowerSections';
+import { NextMissions } from './components/LowerSections';
 import SettingsPanel from './components/SettingsPanel';
 import MobileTabBar from './components/MobileTabBar';
 import StreaksPage from './components/StreaksPage';
-import JournalPage from './components/JournalPage';
 import PowerUpPage from './components/PowerUpPage';
 import GoalsPage from './components/GoalsPage';
 import AuthPage from './components/AuthPage';
+import TechFeedPage from './components/TechFeedPage';
 import SquadGate from './components/SquadGate';
 import { getCurrentUser, Person } from './data';
 import { ACCENTS, AccentKey, applyAccent } from './theme';
@@ -92,23 +92,27 @@ function AppShell() {
             <div className="flex-1 min-w-0 flex flex-col gap-3">
               <MissionHero user={user} />
               <NextMissions compact />
-              <StartupIdeas />
             </div>
             <div className="hidden xl:flex flex-col gap-3 w-[280px] shrink-0 overflow-y-auto">
-              <RightSidebar user={user} />
+              <RightSidebar
+                user={user}
+                onOpenStreaks={() => setTab('streaks')}
+                onOpenTechFeed={() => setTab('tech')}
+              />
             </div>
           </div>
         ) : tab === 'streaks' ? (
           <main className="flex-1 min-w-0 px-4 md:px-6 py-5 pb-24 md:pb-8 overflow-y-auto">
             <StreaksPage user={user} />
           </main>
-        ) : tab === 'journal' ? (
-          <main className="flex-1 min-w-0 px-4 md:px-6 py-5 pb-24 md:pb-8 overflow-hidden">
-            <JournalPage />
-          </main>
+
         ) : tab === 'powerup' ? (
           <main className="flex-1 min-w-0 px-4 md:px-6 py-5 pb-24 md:pb-8 overflow-y-auto">
             <PowerUpPage />
+          </main>
+        ) : tab === 'tech' ? (
+          <main className="flex-1 min-w-0 px-4 md:px-6 py-5 pb-24 md:pb-8 overflow-y-auto">
+            <TechFeedPage onBack={() => setTab('mission')} />
           </main>
         ) : tab === 'goals' ? (
           <main className="flex-1 min-w-0 px-4 md:px-6 py-5 pb-24 md:pb-8 overflow-y-auto">

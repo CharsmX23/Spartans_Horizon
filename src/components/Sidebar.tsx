@@ -1,16 +1,15 @@
 import { useState } from 'react';
 import {
-  Home, Rocket, Flame, BookOpen,
-  Users, Settings, ChevronLeft, ChevronRight,
+  Home, Settings, ChevronLeft, ChevronRight,
   Zap, Target,
 } from 'lucide-react';
-import { PEOPLE } from '../data';
-import { ACCENTS } from '../theme';
 
+// 'streaks' and 'squad' remain routable — they are reachable without a nav link
+// (Streaks via the Upload Proof button and the mobile tab bar; squad info lives in
+// Settings). Removing them from TabKey would delete the routes, not just the links.
 export type TabKey =
-  | 'mission' | 'startup' | 'streaks'
-  | 'journal' | 'powerup' | 'goals'
-  | 'squad' | 'settings';
+  | 'mission' | 'streaks' | 'powerup'
+  | 'goals' | 'squad' | 'settings' | 'tech';
 
 interface NavItem {
   key: TabKey;
@@ -21,12 +20,8 @@ interface NavItem {
 
 const NAV: NavItem[] = [
   { key: 'mission',  label: 'Mission Control', icon: Home },
-  { key: 'startup',  label: 'Startup Ideas',   icon: Rocket, badge: 3 },
-  { key: 'streaks',  label: 'Streaks',          icon: Flame },
-  { key: 'journal',  label: 'Journal',          icon: BookOpen },
   { key: 'powerup',  label: 'Power Up',         icon: Zap },
   { key: 'goals',    label: 'Goals',            icon: Target },
-  { key: 'squad',    label: 'Squad',            icon: Users },
   { key: 'settings', label: 'Settings',         icon: Settings },
 ];
 
@@ -37,7 +32,6 @@ interface Props {
 
 export default function Sidebar({ active, onChange }: Props) {
   const [collapsed, setCollapsed] = useState(false);
-  const online = PEOPLE.filter((p) => p.online);
   const width = collapsed ? 'w-[60px]' : 'w-52';
 
   return (
@@ -101,27 +95,6 @@ export default function Sidebar({ active, onChange }: Props) {
           );
         })}
       </nav>
-
-      {/* Squad online */}
-      {!collapsed && (
-        <div className="mt-4 glass p-3">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-[9px] tracked-sm text-white/45">SQUAD ONLINE</span>
-            <span className="text-[9px] text-white/35">{online.length}/{PEOPLE.length}</span>
-          </div>
-          <div className="flex -space-x-2">
-            {online.slice(0, 5).map((p) => (
-              <div key={p.id} className="relative">
-                <img src={p.avatar} alt={p.name} className="w-6 h-6 rounded-full ring-2 ring-ink" />
-                <span
-                  className="absolute -bottom-0.5 -right-0.5 w-1.5 h-1.5 rounded-full ring-1 ring-ink"
-                  style={{ background: ACCENTS[p.accent].hex }}
-                />
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
 
       {!collapsed && (
         <div className="mt-auto pt-4 text-center">

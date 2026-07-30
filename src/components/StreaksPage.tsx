@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { Flame, Upload, CheckCircle, XCircle, Zap } from 'lucide-react';
 import { supabase } from '../lib/supabase';
+import { verifyProof, validateProofFile } from '../lib/proof';
+import { useAuth } from '../lib/auth';
 import { ACCENTS } from '../theme';
 import { Person } from '../data';
 
@@ -13,51 +15,32 @@ interface StreakLog {
 
 interface Props { user: Person; }
 
-type UploadState = 'idle' | 'preview' | 'verifying' | 'verified' | 'error';
+type UploadState =
+  | 'idle'
+  | 'preview'
+  | 'submitting'
+  | 'verified'   // reachable only on a genuine 'progress' verdict from Gemini
+  | 'rejected'   // Gemini ran and said no
+  | 'error';
 
 function todayStr() { return new Date().toISOString().split('T')[0]; }
 
-function calcStreak(logs: StreakLog[]): number {
-  if (!logs.length) return 0;
-  const sorted = [...logs].filter(l => l.verified).sort((a, b) => b.log_date.localeCompare(a.log_date));
-  if (!sorted.length) return 0;
-  let streak = 0;
-  let expected = todayStr();
-  // Allow yesterday if today not yet submitted
-  if (sorted[0].log_date < expected) {
-    const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
-    const ys = yesterday.toISOString().split('T')[0];
-    if (sorted[0].log_date === ys) expected = ys;
-    else return 0;
-  }
-  for (const log of sorted) {
-    if (log.log_date === expected) {
-      streak++;
-      const d = new Date(expected); d.setDate(d.getDate() - 1);
-      expected = d.toISOString().split('T')[0];
-    } else { break; }
-  }
-  return streak;
-}
-
-const AI_MESSAGES = [
-  'Solid proof. Discipline verified. Streak continues — keep the chain unbroken.',
-  'Progress confirmed. The machine never stops. +1 to the chain.',
-  'Verified. Consistency is the rarest form of talent. You have it.',
-  'Proof accepted. One day at a time builds a decade of mastery.',
-  'AI analysis: real work detected. Keep shipping. Streak locked in.',
-];
+/** What the photo is judged against for a daily streak check-in. */
+const STREAK_CONTEXT = 'making genuine, visible daily progress on my own work or training';
 
 export default function StreaksPage({ user }: Props) {
+  const { refreshProfile } = useAuth();
   const accent = ACCENTS[user.accent];
   const [logs, setLogs] = useState<StreakLog[]>([]);
   const [uploadState, setUploadState] = useState<UploadState>('idle');
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [aiMessage, setAiMessage] = useState('');
-  const [loading, setLoading] = useState(true);
+  const [file, setFile] = useState<File | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const streak = calcStreak(logs);
+  // Authoritative value from users.current_streak, maintained by record_checkin().
+  // Deliberately NOT recomputed from logs — two sources of truth would drift.
+  const streak = user.streak;
   const todayLog = logs.find(l => l.log_date === todayStr());
   const todayDone = todayLog?.verified ?? false;
 
@@ -66,47 +49,67 @@ export default function StreaksPage({ user }: Props) {
   }, []);
 
   async function loadLogs() {
-    setLoading(true);
     const { data } = await supabase
       .from('streak_logs')
       .select('id, log_date, verified, note')
       .order('log_date', { ascending: false })
       .limit(60);
     if (data) setLogs(data as StreakLog[]);
-    setLoading(false);
   }
 
   function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const url = URL.createObjectURL(file);
-    setPreviewUrl(url);
+    const selected = e.target.files?.[0];
+    if (!selected) return;
+
+    const invalid = validateProofFile(selected);
+    if (invalid) {
+      setMessage(invalid);
+      setUploadState('error');
+      return;
+    }
+
+    // Blob URL for the local preview only; revoked in resetUpload so the bytes are
+    // released rather than lingering in the document.
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    setFile(selected);
+    setPreviewUrl(URL.createObjectURL(selected));
+    setMessage(null);
     setUploadState('preview');
   }
 
   async function handleVerify() {
-    if (!previewUrl) return;
-    setUploadState('verifying');
-    // Simulate AI verification delay
-    await new Promise(r => setTimeout(r, 2200));
+    if (!file) return;
+    setUploadState('submitting');
+    setMessage(null);
 
-    const today = todayStr();
-    const msg = AI_MESSAGES[Math.floor(Math.random() * AI_MESSAGES.length)];
+    const result = await verifyProof({ file, context: STREAK_CONTEXT, kind: 'streak' });
 
-    if (todayLog) {
-      await supabase.from('streak_logs').update({ verified: true, note: msg }).eq('id', todayLog.id);
-    } else {
-      await supabase.from('streak_logs').insert({ log_date: today, verified: true, note: msg });
+    if (!result.ok) {
+      setMessage(result.message);
+      setUploadState('error');
+      return;
     }
 
-    setAiMessage(msg);
+    if (result.verdict.verdict !== 'progress') {
+      setMessage(result.verdict.evaluation_text);
+      setUploadState('rejected');
+      return;
+    }
+
+    // The check-in was already recorded server-side by record_checkin() inside the
+    // Edge Function — the client cannot write these fields. Refetch rather than trust
+    // the message: the number on screen has to be what is actually in the database.
+    setMessage(result.verdict.evaluation_text);
     setUploadState('verified');
-    await loadLogs();
+    await Promise.all([loadLogs(), refreshProfile()]);
   }
 
   function resetUpload() {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
     setUploadState('idle');
     setPreviewUrl(null);
+    setFile(null);
+    setMessage(null);
     if (fileRef.current) fileRef.current.value = '';
   }
 
@@ -132,7 +135,7 @@ export default function StreaksPage({ user }: Props) {
           <div className="flex items-center gap-3">
             <Flame className="w-10 h-10" style={{ color: accent.hex }} />
             <span style={{ fontSize: 80, fontWeight: 900, color: '#fff', lineHeight: 1, fontVariantNumeric: 'tabular-nums' }}>
-              {loading ? '–' : streak}
+              {streak}
             </span>
           </div>
           <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.5)', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
@@ -183,16 +186,49 @@ export default function StreaksPage({ user }: Props) {
             </div>
           )}
 
-          {uploadState === 'verifying' && (
+          {uploadState === 'submitting' && (
             <div className="flex flex-col items-center gap-4 py-8">
               <div className="relative">
                 <div className="w-16 h-16 rounded-full animate-spin" style={{ border: `3px solid rgba(255,255,255,0.08)`, borderTopColor: accent.hex }} />
                 <Zap className="w-6 h-6 absolute inset-0 m-auto" style={{ color: accent.hex }} />
               </div>
               <div style={{ color: accent.hex, fontSize: 14, fontWeight: 600, letterSpacing: '0.06em' }}>
-                AI ANALYZING YOUR PROOF…
+                SENDING FOR VERIFICATION…
               </div>
-              <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: 12 }}>Checking for real progress</div>
+              <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: 12 }}>
+                Your photo is sent for analysis and never stored
+              </div>
+            </div>
+          )}
+
+          {uploadState === 'rejected' && (
+            <div className="flex flex-col items-center gap-3 py-6 text-center">
+              <XCircle className="w-10 h-10" style={{ color: '#F87171' }} />
+              <div style={{ fontSize: 16, fontWeight: 700, color: '#fff' }}>No progress detected</div>
+              <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.6)', maxWidth: 420, fontStyle: 'italic' }}>
+                "{message}"
+              </div>
+              <button
+                onClick={resetUpload}
+                className="mt-1 px-4 py-2 rounded-lg text-sm text-white/70 hover:text-white transition"
+                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)' }}
+              >
+                Try another photo
+              </button>
+            </div>
+          )}
+
+          {uploadState === 'error' && (
+            <div className="flex flex-col items-center gap-3 py-6 text-center">
+              <XCircle className="w-10 h-10" style={{ color: '#F87171' }} />
+              <div style={{ fontSize: 14, color: 'rgba(255,255,255,0.7)', maxWidth: 420 }}>{message}</div>
+              <button
+                onClick={resetUpload}
+                className="mt-1 px-4 py-2 rounded-lg text-sm text-white/70 hover:text-white transition"
+                style={{ background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.10)' }}
+              >
+                Try again
+              </button>
             </div>
           )}
 
@@ -201,7 +237,7 @@ export default function StreaksPage({ user }: Props) {
               <CheckCircle className="w-12 h-12" style={{ color: '#34D399' }} />
               <div style={{ fontSize: 18, fontWeight: 700, color: '#fff' }}>Streak Verified!</div>
               <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.6)', maxWidth: 400, textAlign: 'center', fontStyle: 'italic' }}>
-                "{aiMessage}"
+                "{message}"
               </div>
               <div style={{ fontSize: 12, color: '#34D399', fontWeight: 600 }}>+1 streak day added</div>
             </div>

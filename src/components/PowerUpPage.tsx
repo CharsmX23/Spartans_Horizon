@@ -1,24 +1,25 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus, X, Trash2, CheckCircle2, Circle, ChevronUp, ChevronDown,
-  BookMarked, Sparkles, Clock, Users, Lock,
+  BookMarked, Sparkles, Clock, Users, Lock, Camera, Loader2,
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/auth';
 import {
-  LearningPath, LearningModule, ProofType, PROOF_TYPES,
+  LearningPath, LearningModule, LearningTask, ProofType, PROOF_TYPES,
   loadPaths, createPath, updatePath, deletePath,
   createModule, updateModule, deleteModule,
   createTask, deleteTask,
   setTaskDone, reorder, pathProgress,
 } from '../lib/learning';
+import { verifyProof, validateProofFile } from '../lib/proof';
 
 /**
  * Power Up — manual CRUD over learning paths, modules, and tasks.
  *
- * No AI here by design: generation and proof verification are Phase 4. Every path is
- * hand-built so the shape and the checkbox flow are proven before the generator writes
- * into the same tables.
+ * Paths are built by hand (syllabus generation is still Phase 4). Tasks can be ticked
+ * two ways: manually, or by submitting a photo that the `verify-proof` Edge Function
+ * judges with Gemini — a passing verdict ticks the task server-side via set_task_done().
  *
  * Squadmates' paths are visible but read-only. RLS and the column grants enforce that;
  * the UI only reflects it.
@@ -66,6 +67,13 @@ export default function PowerUpPage() {
   const [addingTaskTo, setAddingTaskTo] = useState<string | null>(null);
   const [editingTerms, setEditingTerms] = useState(false);
 
+  // Photo-proof verification. The pending task is held only long enough to attach the
+  // picked file to it; the image itself never leaves this call chain.
+  const proofInputRef = useRef<HTMLInputElement>(null);
+  const pendingTask = useRef<LearningTask | null>(null);
+  const [verifyingTaskId, setVerifyingTaskId] = useState<string | null>(null);
+  const [verdict, setVerdict] = useState<{ passed: boolean; text: string } | null>(null);
+
   const load = useCallback(async () => {
     const { data, error: loadError } = await loadPaths();
     if (loadError) {
@@ -107,6 +115,42 @@ export default function PowerUpPage() {
   );
   const isOwner = selected?.user_id === myId;
 
+  /** Opens the picker for a task; the file lands in handleProofSelected below. */
+  const startProof = useCallback((task: LearningTask) => {
+    pendingTask.current = task;
+    setVerdict(null);
+    setError(null);
+    proofInputRef.current?.click();
+  }, []);
+
+  async function handleProofSelected(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    const task = pendingTask.current;
+    // Reset immediately so picking the same file twice still fires onChange.
+    if (proofInputRef.current) proofInputRef.current.value = '';
+    if (!file || !task) return;
+
+    const invalid = validateProofFile(file);
+    if (invalid) { setError(invalid); return; }
+
+    setVerifyingTaskId(task.id);
+    const result = await verifyProof({
+      file,
+      context: task.label,
+      kind: 'task',
+      taskId: task.id,
+    });
+    setVerifyingTaskId(null);
+    pendingTask.current = null;
+
+    if (!result.ok) { setError(result.message); return; }
+
+    const passed = result.verdict.verdict === 'progress';
+    setVerdict({ passed, text: result.verdict.evaluation_text });
+    // The Edge Function already ticked it via set_task_done(); reload to reflect that.
+    if (passed && result.verdict.task_confirmed) await load();
+  }
+
   if (loading) {
     return <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: 13, padding: 24 }}>Loading paths…</div>;
   }
@@ -144,6 +188,36 @@ export default function PowerUpPage() {
           </button>
         </div>
       )}
+
+      {verdict && (
+        <div style={{
+          display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 12, borderRadius: 10,
+          padding: '10px 12px',
+          color: verdict.passed ? '#86efac' : '#fca5a5',
+          background: verdict.passed ? 'rgba(52,211,153,0.10)' : 'rgba(239,68,68,0.10)',
+          border: `1px solid ${verdict.passed ? 'rgba(52,211,153,0.30)' : 'rgba(239,68,68,0.30)'}`,
+        }}>
+          <span style={{ flex: 1 }}>
+            <strong>{verdict.passed ? 'Proof accepted — task ticked.' : 'Proof rejected.'}</strong>{' '}
+            {verdict.text}
+          </span>
+          <button
+            onClick={() => setVerdict(null)}
+            style={{ background: 'none', border: 'none', color: 'inherit', cursor: 'pointer' }}
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {/* One picker for every task; the image is read in memory and never stored. */}
+      <input
+        ref={proofInputRef}
+        type="file"
+        accept="image/*"
+        style={{ display: 'none' }}
+        onChange={handleProofSelected}
+      />
 
       {showNewPath && (
         <NewPathForm
@@ -215,6 +289,8 @@ export default function PowerUpPage() {
           setAddingTaskTo={setAddingTaskTo}
           editingTerms={editingTerms}
           setEditingTerms={setEditingTerms}
+          onVerifyTask={startProof}
+          verifyingTaskId={verifyingTaskId}
         />
       )}
     </div>
@@ -237,6 +313,8 @@ interface DetailProps {
   setAddingTaskTo: (v: string | null) => void;
   editingTerms: boolean;
   setEditingTerms: (v: boolean) => void;
+  onVerifyTask: (task: LearningTask) => void;
+  verifyingTaskId: string | null;
 }
 
 function PathDetail(props: DetailProps) {
@@ -244,6 +322,7 @@ function PathDetail(props: DetailProps) {
     path, isOwner, ownerName, busy, run,
     addingModuleTo, setAddingModuleTo, editingModule, setEditingModule,
     addingTaskTo, setAddingTaskTo, editingTerms, setEditingTerms,
+    onVerifyTask, verifyingTaskId,
   } = props;
 
   const { done, total, percent } = pathProgress(path);
@@ -329,6 +408,8 @@ function PathDetail(props: DetailProps) {
           setEditing={(on) => setEditingModule(on ? mod.id : null)}
           isAddingTask={addingTaskTo === mod.id}
           setAddingTask={(on) => setAddingTaskTo(on ? mod.id : null)}
+          onVerifyTask={onVerifyTask}
+          verifyingTaskId={verifyingTaskId}
         />
       ))}
 
@@ -466,7 +547,7 @@ function FoundationalTerms({ path, isOwner, busy, run, editing, setEditing }: {
 
 /* ────────────────────────── Module card ────────────────────────── */
 
-function ModuleCard({ module: mod, path, index, isOwner, busy, run, isEditing, setEditing, isAddingTask, setAddingTask }: {
+function ModuleCard({ module: mod, path, index, isOwner, busy, run, isEditing, setEditing, isAddingTask, setAddingTask, onVerifyTask, verifyingTaskId }: {
   module: LearningModule;
   path: LearningPath;
   index: number;
@@ -477,6 +558,8 @@ function ModuleCard({ module: mod, path, index, isOwner, busy, run, isEditing, s
   setEditing: (v: boolean) => void;
   isAddingTask: boolean;
   setAddingTask: (v: boolean) => void;
+  onVerifyTask: (task: LearningTask) => void;
+  verifyingTaskId: string | null;
 }) {
   const doneCount = mod.tasks.filter((t) => t.is_done).length;
 
@@ -622,6 +705,19 @@ function ModuleCard({ module: mod, path, index, isOwner, busy, run, isEditing, s
 
             {isOwner && (
               <div style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
+                {/* Photo proof — Gemini judges the image against this task's label and
+                    ticks it via set_task_done() only on a passing verdict. */}
+                {!task.is_done && (
+                  <IconButton
+                    title={`Verify with a photo — judged against "${task.label}"`}
+                    disabled={busy || verifyingTaskId !== null}
+                    onClick={() => onVerifyTask(task)}
+                  >
+                    {verifyingTaskId === task.id
+                      ? <Loader2 className="w-3 h-3 animate-spin" />
+                      : <Camera className="w-3 h-3" />}
+                  </IconButton>
+                )}
                 <IconButton
                   title="Move up"
                   disabled={busy || taskIndex === 0}

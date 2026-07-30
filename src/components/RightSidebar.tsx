@@ -1,17 +1,35 @@
-import { Flame, Check, Circle, Camera, ArrowRight, Sparkles } from 'lucide-react';
-import { Person, HABITS, TECH_TODAY, INDUSTRY_UPDATE, TechCard } from '../data';
+import { useEffect, useState } from 'react';
+import { Flame, Check, Circle, Camera, ArrowRight, Sparkles, ExternalLink } from 'lucide-react';
+import { Person, HABITS } from '../data';
 import { ACCENTS } from '../theme';
+import { Story, fetchTopStories, commentsUrl, relativeTime, domainOf } from '../lib/hn';
 
 interface Props {
   user: Person;
+  onOpenStreaks: () => void;
+  onOpenTechFeed: () => void;
 }
 
-export default function RightSidebar({ user }: Props) {
+export default function RightSidebar({ user, onOpenStreaks, onOpenTechFeed }: Props) {
   const accent = ACCENTS[user.accent];
   const ringPct = Math.min(user.streak / 60, 1);
   const r = 26;
   const circ = 2 * Math.PI * r;
   const offset = circ * (1 - ringPct);
+
+  // One fetch feeds both news panels; hn.ts dedupes concurrent callers.
+  const [stories, setStories] = useState<Story[] | null>(null);
+  const [newsError, setNewsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    fetchTopStories(6)
+      .then((rows) => { if (mounted) setStories(rows); })
+      .catch((e: unknown) => {
+        if (mounted) setNewsError(e instanceof Error ? e.message : 'Could not reach Hacker News');
+      });
+    return () => { mounted = false; };
+  }, []);
 
   return (
     <div className="flex flex-col gap-4">
@@ -37,7 +55,7 @@ export default function RightSidebar({ user }: Props) {
               strokeDashoffset={offset}
               transform="rotate(-90 32 32)"
               className="ring-anim"
-              style={{ ['--ring-circ' as any]: circ, ['--ring-offset' as any]: offset, filter: `drop-shadow(0 0 6px ${accent.hex}80)` }}
+              style={{ ['--ring-circ' as string]: circ, ['--ring-offset' as string]: offset, filter: `drop-shadow(0 0 6px ${accent.hex}80)` } as React.CSSProperties}
             />
           </svg>
         </div>
@@ -54,7 +72,9 @@ export default function RightSidebar({ user }: Props) {
             </div>
           ))}
         </div>
+        {/* Also the desktop entry point to Streaks, which no longer has a nav link. */}
         <button
+          onClick={onOpenStreaks}
           className="mt-3 w-full py-2.5 rounded-full text-sm font-semibold flex items-center justify-center gap-2 transition hover:brightness-110"
           style={{ background: `linear-gradient(135deg, ${accent.hex}, ${accent.hex}99)`, color: 'white', boxShadow: `0 8px 24px -8px ${accent.hex}80` }}
         >
@@ -62,11 +82,11 @@ export default function RightSidebar({ user }: Props) {
         </button>
       </div>
 
-      {/* Today's Tech */}
-      <TechPanel title="Today's Tech" card={TECH_TODAY} />
-      <TechPanel title="Industry Update" card={INDUSTRY_UPDATE} />
+      {/* Live Hacker News — top story and runner-up */}
+      <NewsPanel title="Today's Tech" story={stories?.[0]} error={newsError} loading={!stories && !newsError} onSeeAll={onOpenTechFeed} />
+      <NewsPanel title="Industry Update" story={stories?.[1]} error={newsError} loading={!stories && !newsError} onSeeAll={onOpenTechFeed} />
 
-      {/* Insights */}
+      {/* Insights — app-generated stats about your own work, not news */}
       <div className="glass p-4">
         <div className="flex items-center gap-2 mb-2">
           <Sparkles className="w-4 h-4" style={{ color: accent.hex }} />
@@ -80,24 +100,73 @@ export default function RightSidebar({ user }: Props) {
   );
 }
 
-function TechPanel({ title, card }: { title: string; card: TechCard }) {
+function NewsPanel({ title, story, loading, error, onSeeAll }: {
+  title: string;
+  story?: Story;
+  loading: boolean;
+  error: string | null;
+  onSeeAll: () => void;
+}) {
+  const href = story ? (story.url ?? commentsUrl(story.id)) : null;
+  const domain = story ? domainOf(story.url) : null;
+
   return (
     <div className="glass p-4">
       <div className="flex items-center justify-between mb-3">
         <span className="text-[10px] tracked-sm text-white/50">{title.toUpperCase()}</span>
-        <button className="text-[11px] text-white/50 hover:text-white transition flex items-center gap-1">
+        <button
+          onClick={onSeeAll}
+          className="text-[11px] text-white/50 hover:text-white transition flex items-center gap-1"
+        >
           See All <ArrowRight className="w-3 h-3" />
         </button>
       </div>
-      <div className="flex items-center gap-2 mb-2">
-        <span className="text-[10px] px-2 py-0.5 rounded-full bg-white/5 border border-white/10 text-white/70">{card.category}</span>
-        <span className="text-[10px] text-white/40">{card.readMins} min read</span>
-      </div>
-      <h3 className="text-white font-semibold text-sm leading-snug">{card.headline}</h3>
-      <p className="text-[12px] text-white/55 mt-1 leading-snug">{card.summary}</p>
-      <button className="text-[12px] mt-2 flex items-center gap-1" style={{ color: 'var(--accent)' }}>
-        Read <ArrowRight className="w-3 h-3" />
-      </button>
+
+      {loading && (
+        <div className="animate-pulse flex flex-col gap-2">
+          <div className="h-3 w-20 rounded bg-white/10" />
+          <div className="h-3.5 w-full rounded bg-white/10" />
+          <div className="h-3.5 w-4/5 rounded bg-white/10" />
+        </div>
+      )}
+
+      {!loading && error && (
+        <p className="text-[12px] text-white/40 leading-snug">
+          Couldn't load Hacker News — {error}
+        </p>
+      )}
+
+      {!loading && !error && !story && (
+        <p className="text-[12px] text-white/40">No stories right now.</p>
+      )}
+
+      {!loading && !error && story && (
+        <>
+          <div className="flex items-center gap-2 mb-2 flex-wrap">
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-white/5 border border-white/10 text-white/70">
+              {domain ?? 'discussion'}
+            </span>
+            <span className="text-[10px] text-white/40">
+              {story.score} pts · {relativeTime(story.time)}
+            </span>
+          </div>
+          <h3 className="text-white font-semibold text-sm leading-snug">{story.title}</h3>
+          <p className="text-[12px] text-white/55 mt-1 leading-snug">
+            {story.descendants} comment{story.descendants === 1 ? '' : 's'} · by {story.by}
+          </p>
+          {href && (
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[12px] mt-2 flex items-center gap-1"
+              style={{ color: 'var(--accent)' }}
+            >
+              Read <ExternalLink className="w-3 h-3" />
+            </a>
+          )}
+        </>
+      )}
     </div>
   );
 }

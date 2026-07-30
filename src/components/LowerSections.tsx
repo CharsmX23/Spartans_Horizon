@@ -1,128 +1,251 @@
+import { useCallback, useEffect, useState, FormEvent } from 'react';
+import { Rocket, Plus, X, Trash2, Pencil, Check } from 'lucide-react';
 import {
-  ArrowRight, Rocket, Binary, BookOpen, Users, Star,
-  ArrowBigUp, MessageCircle, Eye, BarChart3, Mic, Flame,
-} from 'lucide-react';
-import { DEADLINES, STARTUP_IDEAS, Deadline, StartupIdea } from '../data';
-
-const WARN = '#FF4D2E';
-
-const PRIORITY_COLOR: Record<Deadline['priority'], string> = {
-  Critical: '#FF4D2A',
-  High: '#FF8A1E',
-  Medium: '#F5C518',
-};
-
-const ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
-  Rocket, Binary, BookOpen, Users, BarChart3, Mic, Flame,
-};
+  Mission, loadMissions, createMission, updateMission, deleteMission,
+  deadlineLabel, deadlineColor,
+} from '../lib/missions';
 
 /* ── Next Missions ──────────────────────────────────────────────────────── */
+/**
+ * Real, private, user-entered missions. Title + deadline only.
+ *
+ * No priority badge and no progress bar: those columns exist but hold nothing, and
+ * rendering a fabricated "78% CRITICAL" would be a signal that means nothing. The
+ * coloured countdown is derived from the actual date, so it is real.
+ */
 export function NextMissions({ compact }: { compact?: boolean }) {
+  const [missions, setMissions] = useState<Mission[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    const { data, error: loadError } = await loadMissions();
+    if (loadError) { setError(loadError); setMissions([]); return; }
+    setMissions(data ?? []);
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  async function run(action: () => Promise<{ error: string | null }>) {
+    setBusy(true);
+    setError(null);
+    const { error: actionError } = await action();
+    if (actionError) setError(actionError);
+    else await load();
+    setBusy(false);
+    return !actionError;
+  }
+
+  const gridCols = compact
+    ? 'grid-cols-1 sm:grid-cols-2'
+    : 'grid-cols-1 sm:grid-cols-2 xl:grid-cols-4';
+
   return (
     <section>
-      <Header title="Next Missions" />
-      <div className={`grid gap-2.5 ${compact ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1 sm:grid-cols-2 xl:grid-cols-4'}`}>
-        {DEADLINES.map((d) => {
-          const Icon = ICONS[d.icon] || Rocket;
-          return (
-            <div key={d.id} className="glass glass-hover p-3.5 flex flex-col gap-2.5">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2.5">
-                  <span
-                    className="w-8 h-8 rounded-lg grid place-items-center shrink-0"
-                    style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}
-                  >
-                    <Icon className="w-3.5 h-3.5 text-white/70" />
-                  </span>
-                  <div>
-                    <h3 className="text-white text-xs font-semibold leading-snug line-clamp-1">{d.title}</h3>
-                    <span className="text-[10px] font-semibold" style={{ color: WARN }}>{d.daysLeft} Days Left</span>
-                  </div>
-                </div>
-                <span
-                  className="text-[9px] font-bold px-1.5 py-0.5 rounded-full shrink-0 ml-2"
-                  style={{
-                    background: `${PRIORITY_COLOR[d.priority]}22`,
-                    color: PRIORITY_COLOR[d.priority],
-                    border: `1px solid ${PRIORITY_COLOR[d.priority]}55`,
-                  }}
-                >
-                  {d.priority.toUpperCase()}
-                </span>
-              </div>
-              <div>
-                <div className="flex items-center justify-between text-[9px] text-white/40 mb-1">
-                  <span>Progress</span><span>{d.progress}%</span>
-                </div>
-                <div className="h-1 rounded-full bg-white/5 overflow-hidden">
-                  <div className="h-full rounded-full" style={{ width: `${d.progress}%`, background: 'var(--accent)' }} />
-                </div>
-              </div>
-            </div>
-          );
-        })}
+      <div className="flex items-center justify-between mb-2.5">
+        <h2 className="text-white font-semibold text-sm">Next Missions</h2>
+        <button
+          onClick={() => { setAdding(true); setEditingId(null); }}
+          className="text-[11px] text-white/50 hover:text-white transition flex items-center gap-1"
+        >
+          <Plus className="w-3 h-3" /> Add
+        </button>
       </div>
-    </section>
-  );
-}
 
-/* ── Startup Ideas (standalone, no Squad Activity) ──────────────────────── */
-export function StartupIdeas() {
-  return (
-    <section>
-      <Header title="Startup Ideas" />
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
-        {STARTUP_IDEAS.map((idea) => <IdeaCard key={idea.id} idea={idea} />)}
-      </div>
-    </section>
-  );
-}
-
-function IdeaCard({ idea }: { idea: StartupIdea }) {
-  const Icon = ICONS[idea.icon] || Rocket;
-  return (
-    <div className="glass glass-hover p-3.5 flex flex-col gap-2">
-      <div className="flex items-start justify-between">
-        <div className="flex items-center gap-2.5">
-          <span
-            className="w-8 h-8 rounded-lg grid place-items-center shrink-0"
-            style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}
-          >
-            <Icon className="w-3.5 h-3.5 text-white/70" />
-          </span>
-          <h3 className="text-white font-semibold text-xs leading-snug">{idea.title}</h3>
+      {error && (
+        <div
+          className="flex items-start gap-2 text-[11px] rounded-lg px-3 py-2 mb-2.5"
+          style={{ color: '#fca5a5', background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.30)' }}
+        >
+          <span className="flex-1">{error}</span>
+          <button onClick={() => setError(null)} style={{ color: 'inherit' }}>
+            <X className="w-3 h-3" />
+          </button>
         </div>
-        <div className="flex items-center gap-0.5 shrink-0 ml-2">
-          {Array.from({ length: 5 }).map((_, i) => (
-            <Star key={i} className="w-2.5 h-2.5"
-              style={{ color: i < idea.rating ? '#F5A524' : 'rgba(255,255,255,0.12)' }}
-              fill={i < idea.rating ? '#F5A524' : 'transparent'}
-            />
+      )}
+
+      {adding && (
+        <MissionForm
+          busy={busy}
+          onCancel={() => setAdding(false)}
+          onSubmit={async (values) => {
+            const ok = await run(() => createMission(values));
+            if (ok) setAdding(false);
+          }}
+        />
+      )}
+
+      {missions === null && <MissionSkeleton cols={gridCols} />}
+
+      {missions?.length === 0 && !adding && (
+        <button
+          onClick={() => setAdding(true)}
+          className="glass glass-hover w-full p-6 flex flex-col items-center gap-1.5 text-center"
+          style={{ borderStyle: 'dashed' }}
+        >
+          <Rocket className="w-5 h-5 text-white/30" />
+          <span className="text-white/70 text-xs font-semibold">No missions yet</span>
+          <span className="text-white/35 text-[11px]">Add your first mission and its deadline.</span>
+        </button>
+      )}
+
+      {missions && missions.length > 0 && (
+        <div className={`grid gap-2.5 ${gridCols}`}>
+          {missions.map((m) => (
+            editingId === m.id ? (
+              <MissionForm
+                key={m.id}
+                busy={busy}
+                initial={m}
+                onCancel={() => setEditingId(null)}
+                onSubmit={async (values) => {
+                  const ok = await run(() => updateMission(m.id, values));
+                  if (ok) setEditingId(null);
+                }}
+              />
+            ) : (
+              <MissionCard
+                key={m.id}
+                mission={m}
+                busy={busy}
+                onEdit={() => { setEditingId(m.id); setAdding(false); }}
+                onDelete={() => {
+                  if (!confirm(`Delete "${m.title}"?`)) return;
+                  void run(() => deleteMission(m.id));
+                }}
+              />
+            )
           ))}
         </div>
+      )}
+    </section>
+  );
+}
+
+function MissionCard({ mission, busy, onEdit, onDelete }: {
+  mission: Mission;
+  busy: boolean;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const color = deadlineColor(mission.deadline);
+
+  return (
+    <div className="glass glass-hover p-3.5 flex items-center gap-2.5 group">
+      <span
+        className="w-8 h-8 rounded-lg grid place-items-center shrink-0"
+        style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}
+      >
+        <Rocket className="w-3.5 h-3.5 text-white/70" />
+      </span>
+
+      <div className="min-w-0 flex-1">
+        <h3 className="text-white text-xs font-semibold leading-snug line-clamp-1">{mission.title}</h3>
+        <span className="text-[10px] font-semibold" style={{ color }}>
+          {deadlineLabel(mission.deadline)}
+        </span>
       </div>
-      <p className="text-[11px] text-white/50 leading-snug">{idea.description}</p>
-      <div className="flex flex-wrap gap-1">
-        {idea.tags.map((t) => (
-          <span key={t} className="text-[9px] px-1.5 py-0.5 rounded-full bg-white/5 border border-white/10 text-white/58">{t}</span>
-        ))}
-      </div>
-      <div className="flex items-center gap-3 text-[10px] text-white/40 pt-1 border-t border-white/5">
-        <span className="flex items-center gap-0.5"><ArrowBigUp className="w-3 h-3" />{idea.upvotes}</span>
-        <span className="flex items-center gap-0.5"><MessageCircle className="w-3 h-3" />{idea.comments}</span>
-        <span className="flex items-center gap-0.5"><Eye className="w-3 h-3" />{idea.views}</span>
+
+      <div className="flex gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition">
+        <button
+          onClick={onEdit}
+          disabled={busy}
+          title="Edit mission"
+          className="w-6 h-6 grid place-items-center rounded-md text-white/50 hover:text-white hover:bg-white/10 transition"
+        >
+          <Pencil className="w-3 h-3" />
+        </button>
+        <button
+          onClick={onDelete}
+          disabled={busy}
+          title="Delete mission"
+          className="w-6 h-6 grid place-items-center rounded-md text-white/50 hover:text-red-300 hover:bg-red-500/10 transition"
+        >
+          <Trash2 className="w-3 h-3" />
+        </button>
       </div>
     </div>
   );
 }
 
-function Header({ title }: { title: string }) {
+function MissionForm({ busy, initial, onCancel, onSubmit }: {
+  busy: boolean;
+  initial?: Mission;
+  onCancel: () => void;
+  onSubmit: (values: { title: string; deadline: string | null }) => void;
+}) {
+  const [title, setTitle] = useState(initial?.title ?? '');
+  const [deadline, setDeadline] = useState(initial?.deadline ?? '');
+
+  function submit(e: FormEvent) {
+    e.preventDefault();
+    if (!title.trim()) return;
+    onSubmit({ title, deadline: deadline || null });
+  }
+
+  const field: React.CSSProperties = {
+    background: 'rgba(255,255,255,0.05)',
+    border: '1px solid rgba(255,255,255,0.10)',
+    borderRadius: 9,
+    padding: '6px 9px',
+    color: '#fff',
+    fontSize: 12,
+    outline: 'none',
+  };
+
   return (
-    <div className="flex items-center justify-between mb-2">
-      <h2 className="text-white font-semibold text-sm">{title}</h2>
-      <button className="text-[11px] text-white/50 hover:text-white transition flex items-center gap-1">
-        View All <ArrowRight className="w-3 h-3" />
-      </button>
+    <form onSubmit={submit} className="glass p-3.5 flex flex-col gap-2 mb-2.5">
+      <input
+        value={title}
+        onChange={(e) => setTitle(e.target.value.slice(0, 120))}
+        placeholder="Mission title"
+        autoFocus
+        style={field}
+      />
+      <div className="flex gap-2">
+        <input
+          type="date"
+          value={deadline}
+          onChange={(e) => setDeadline(e.target.value)}
+          style={{ ...field, flex: 1, colorScheme: 'dark' }}
+        />
+        <button
+          type="submit"
+          disabled={busy || !title.trim()}
+          title="Save"
+          className="w-8 h-8 grid place-items-center rounded-lg text-white transition hover:brightness-110 disabled:opacity-40"
+          style={{ background: 'var(--accent)' }}
+        >
+          <Check className="w-3.5 h-3.5" />
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          title="Cancel"
+          className="w-8 h-8 grid place-items-center rounded-lg text-white/60 transition hover:bg-white/10"
+          style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.10)' }}
+        >
+          <X className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function MissionSkeleton({ cols }: { cols: string }) {
+  return (
+    <div className={`grid gap-2.5 ${cols} animate-pulse`}>
+      {Array.from({ length: 2 }).map((_, i) => (
+        <div key={i} className="glass p-3.5 flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-lg bg-white/10 shrink-0" />
+          <div className="flex-1 flex flex-col gap-1.5">
+            <div className="h-3 rounded bg-white/10" style={{ width: `${60 + i * 15}%` }} />
+            <div className="h-2.5 w-16 rounded bg-white/[0.07]" />
+          </div>
+        </div>
+      ))}
     </div>
   );
 }

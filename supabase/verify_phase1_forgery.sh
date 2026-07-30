@@ -68,6 +68,22 @@ probe "rename own squad" "403 — permission denied for table squads" \
 probe "delete own squad" "403 — permission denied for table squads" \
   -X DELETE "$URL/rest/v1/squads?join_code=neq.ZZZZZZ" "${auth[@]}"
 
+echo "── Streak forgery: every field record_checkin() owns ──"
+probe "forge a streak via users.current_streak" "403 — permission denied for column current_streak" \
+  -X PATCH "$URL/rest/v1/users?id=eq.$UID_" "${auth[@]}" -d '{"current_streak":9999}'
+probe "mark today's proof verified directly" "403 — permission denied for table streak_logs" \
+  -X PATCH "$URL/rest/v1/streak_logs?user_id=eq.$UID_" "${auth[@]}" -d '{"verified":true}'
+probe "insert a pre-verified check-in" "403 — permission denied for table streak_logs" \
+  -X POST "$URL/rest/v1/streak_logs" "${auth[@]}" \
+  -d "{\"log_date\":\"2020-01-01\",\"verified\":true,\"note\":\"forged\"}"
+probe "delete a check-in to reshape history" "403 — permission denied for table streak_logs" \
+  -X DELETE "$URL/rest/v1/streak_logs?log_date=eq.2020-01-01" "${auth[@]}"
+probe "call record_checkin() directly (service_role only)" "404 or 403 — not callable by authenticated" \
+  -X POST "$URL/rest/v1/rpc/record_checkin" "${auth[@]}" \
+  -d "{\"p_user_id\":\"$UID_\",\"p_note\":\"forged\"}"
+probe "read own streak history" "200 — reads are still allowed" \
+  "$URL/rest/v1/streak_logs?select=log_date,verified&limit=3" "${auth[@]}"
+
 echo "── Business rules inside the RPCs ──"
 probe "join a second squad while already in one" "400 — 'You are already in a squad'" \
   -X POST "$URL/rest/v1/rpc/create_squad" "${auth[@]}" -d '{"p_name":"Second Squad"}'

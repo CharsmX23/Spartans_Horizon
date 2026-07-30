@@ -74,7 +74,40 @@ message pointing at this.
 While you're in Auth settings, keep the minimum password length at **6** to match the
 signup form's `minLength`.
 
-### 5. Start
+### 5. Deploy the photo-verification Edge Function
+
+Photo proofs (streak check-ins and learning-task proofs) are judged by Gemini inside the
+`verify-proof` Edge Function. The image is sent as base64, held in memory, and discarded
+— it is never written to Storage or to a table, so there is no cleanup that can fail.
+
+```bash
+npx supabase login
+npx supabase link --project-ref <your-project-ref>
+npx supabase functions deploy verify-proof
+```
+
+Or skip linking and target the project directly:
+
+```bash
+npx supabase functions deploy verify-proof --project-ref <your-project-ref>
+```
+
+The function reads `GEMINI_API_KEY` from Edge Function secrets:
+
+```bash
+npx supabase secrets set GEMINI_API_KEY=... --project-ref <your-project-ref>
+npx supabase secrets list --project-ref <your-project-ref>   # confirm the name
+```
+
+**Leave JWT verification ON** (the default — nothing to change in the dashboard). The
+function forwards the caller's token to `set_task_done()` so `auth.uid()` resolves and
+the task's ownership check still applies. Turning it off would let anyone invoke the
+function with the public anon key and burn your Gemini quota.
+
+Logs: `npx supabase functions logs verify-proof`. They deliberately record status codes
+and error messages only — never the image payload.
+
+### 6. Start
 
 ```bash
 npm run dev

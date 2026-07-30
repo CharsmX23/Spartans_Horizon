@@ -61,18 +61,6 @@ export interface TechCard {
   summary: string;
 }
 
-export interface StartupIdea {
-  id: string;
-  title: string;
-  rating: number;
-  description: string;
-  tags: string[];
-  upvotes: number;
-  comments: number;
-  views: number;
-  icon: string;
-}
-
 export interface ActivityItem {
   id: string;
   personId: string;
@@ -109,12 +97,6 @@ export const INDUSTRY_UPDATE: TechCard = {
   headline: 'OpenAI ships cheaper batch inference tier',
   summary: '50% cost reduction for async workloads up to 24h latency.',
 };
-
-export const STARTUP_IDEAS: StartupIdea[] = [
-  { id: 's1', title: 'Glasshouse — solo-founder analytics', rating: 5, description: 'Privacy-first product analytics for one-person startups.', tags: ['SaaS', 'Privacy', 'Analytics'], upvotes: 142, comments: 28, views: 1840, icon: 'BarChart3' },
-  { id: 's2', title: 'Driftwood — async standups', rating: 4, description: 'Voice-first async standups with auto summaries.', tags: ['Productivity', 'Voice'], upvotes: 88, comments: 12, views: 940, icon: 'Mic' },
-  { id: 's3', title: 'Ember — habit forge', rating: 4, description: 'Streaks with on-chain proof of work.', tags: ['Habits', 'Crypto'], upvotes: 64, comments: 9, views: 510, icon: 'Flame' },
-];
 
 export const ACTIVITY: ActivityItem[] = [
   { id: 'a1', personId: 'u5', action: 'shipped a new edge function', timestamp: '2m ago' },

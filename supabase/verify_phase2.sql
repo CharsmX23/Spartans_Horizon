@@ -74,6 +74,28 @@ WHERE n.nspname = 'public'
 ORDER BY p.proname;
 
 
+-- ── 3b. record_checkin() is service_role only ───────────────────────────────
+-- EXPECT: service_role = true, everything else = false. If `authenticated` can
+-- execute this, any signed-in user can hand themselves a streak without a photo.
+SELECT
+  has_function_privilege('service_role',   'public.record_checkin(uuid,text,date)', 'EXECUTE') AS service_role_can_execute,
+  has_function_privilege('authenticated',  'public.record_checkin(uuid,text,date)', 'EXECUTE') AS authenticated_can_execute,
+  has_function_privilege('anon',           'public.record_checkin(uuid,text,date)', 'EXECUTE') AS anon_can_execute;
+
+-- EXPECT: all false — the streak fields are written only by record_checkin().
+SELECT
+  has_column_privilege('authenticated', 'public.users', 'current_streak',    'UPDATE') AS can_write_streak,
+  has_column_privilege('authenticated', 'public.users', 'last_checkin_date', 'UPDATE') AS can_write_checkin_date,
+  has_table_privilege ('authenticated', 'public.streak_logs', 'INSERT')                AS can_insert_logs,
+  has_table_privilege ('authenticated', 'public.streak_logs', 'UPDATE')                AS can_update_logs,
+  has_table_privilege ('authenticated', 'public.streak_logs', 'DELETE')                AS can_delete_logs,
+  has_table_privilege ('authenticated', 'public.streak_logs', 'SELECT')                AS can_read_logs;  -- true
+
+-- EXPECT: SELECT only. The write policies were dropped as dead letters.
+SELECT policyname, cmd FROM pg_policies
+WHERE schemaname = 'public' AND tablename = 'streak_logs' ORDER BY cmd;
+
+
 -- ── 4. Journals stay private ────────────────────────────────────────────────
 -- EXPECT: the SELECT policy on journal_entries is `auth.uid() = user_id` — NOT
 -- shares_squad_with(). Journals are personal; squad sharing is for learning paths.

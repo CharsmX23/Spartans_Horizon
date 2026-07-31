@@ -1,5 +1,6 @@
 /**
- * verify-proof — Gemini vision evaluation for streak proofs and learning-task proofs.
+ * verify-proof — Gemini vision evaluation for streak proofs, learning-task proofs, and
+ * daily-habit proofs.
  *
  * PRIVACY CONTRACT (the reason this function exists at all):
  * The image arrives as base64 in the request body, is held in a local variable for the
@@ -36,11 +37,13 @@ interface VerifyRequest {
   /** Raw base64, no data: prefix. */
   image_base64: string;
   mime_type: string;
-  /** The goal or task label the image is judged against. */
+  /** The goal, task, or habit label the image is judged against. */
   context: string;
-  kind: 'streak' | 'task';
+  kind: 'streak' | 'task' | 'habit';
   /** Required when kind === 'task' — the task to tick on a pass. */
   task_id?: string;
+  /** Required when kind === 'habit' — the habit to record a completion for on a pass. */
+  habit_id?: string;
   /**
    * Diagnostics, no image involved:
    *  - 'list_models' — what the catalogue advertises for this key
@@ -63,7 +66,7 @@ interface StreakState {
 }
 
 type VerifyResponse =
-  | ({ status: 'ok'; task_confirmed: boolean; streak: StreakState | null } & Verdict)
+  | ({ status: 'ok'; task_confirmed: boolean; habit_confirmed: boolean; streak: StreakState | null } & Verdict)
   | { status: 'not_configured'; message: string }
   | { status: 'models'; configured_model: string; available: string[] }
   | { status: 'model_test'; model: string; callable: boolean; detail: string }
@@ -86,9 +89,11 @@ function json(body: VerifyResponse, status: number): Response {
  * Asks one specific question rather than "describe this image" — a vague prompt makes
  * the model agreeable, and an agreeable judge is the same as no judge.
  */
-function buildPrompt(context: string, kind: 'streak' | 'task'): string {
+function buildPrompt(context: string, kind: 'streak' | 'task' | 'habit'): string {
   const subject = kind === 'task'
     ? `completion of this task: "${context}"`
+    : kind === 'habit'
+    ? `completion of this daily habit: "${context}"`
     : `genuine progress toward this goal: "${context}"`;
 
   return [
@@ -117,7 +122,7 @@ async function evaluate(
   imageBase64: string,
   mimeType: string,
   context: string,
-  kind: 'streak' | 'task',
+  kind: 'streak' | 'task' | 'habit',
 ): Promise<Verdict> {
   const response = await fetch(`${GEMINI_API_BASE}/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
     method: 'POST',
@@ -259,7 +264,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
       payload.image_base64,
       payload.mime_type,
       payload.context,
-      payload.kind === 'task' ? 'task' : 'streak',
+      payload.kind === 'task' ? 'task' : payload.kind === 'habit' ? 'habit' : 'streak',
     );
   } catch (e) {
     const message = e instanceof Error ? e.message : 'Verification failed';
@@ -270,6 +275,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   // The image has served its purpose; nothing below this line touches it.
 
   let taskConfirmed = false;
+  let habitConfirmed = false;
   let streak: StreakState | null = null;
 
   if (verdict.verdict === 'progress') {
@@ -301,6 +307,34 @@ Deno.serve(async (req: Request): Promise<Response> => {
       taskConfirmed = true;
     }
 
+    if (payload.kind === 'habit' && payload.habit_id) {
+      // Same trust boundary as the streak branch: record_habit_completion() is
+      // service_role-only, so the user id must come from the verified JWT, never the
+      // body. The function records the completion AND advances the streak (a verified
+      // habit is the day's check-in), so a StreakState comes back nested in the result.
+      const { data: userData, error: userError } = await asUser.auth.getUser();
+      if (userError || !userData.user) {
+        return json({ status: 'error', message: 'Could not identify the caller' }, 401);
+      }
+
+      const admin = createClient(supabaseUrl, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+      const { data, error } = await admin.rpc('record_habit_completion', {
+        p_user_id: userData.user.id,
+        p_habit_id: payload.habit_id,
+        p_note: verdict.evaluation_text,
+      });
+
+      if (error) {
+        console.error('record_habit_completion failed:', error.message);
+        return json({
+          status: 'error',
+          message: `Verified, but could not record the habit: ${error.message}`,
+        }, 500);
+      }
+      habitConfirmed = true;
+      streak = (data as { streak: StreakState } | null)?.streak ?? null;
+    }
+
     if (payload.kind === 'streak') {
       // record_checkin() is service_role-only, so auth.uid() is null inside it and the
       // user id must be passed in. Resolve it from the verified JWT — never from the
@@ -327,5 +361,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }
   }
 
-  return json({ status: 'ok', task_confirmed: taskConfirmed, streak, ...verdict }, 200);
+  return json({
+    status: 'ok',
+    task_confirmed: taskConfirmed,
+    habit_confirmed: habitConfirmed,
+    streak,
+    ...verdict,
+  }, 200);
 });

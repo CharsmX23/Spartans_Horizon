@@ -21,7 +21,12 @@ export interface ProofVerdict {
   evaluation_text: string;
   /** True when the function successfully ticked the task via set_task_done(). */
   task_confirmed: boolean;
-  /** Server-computed streak after a passing 'streak' check-in; null otherwise. */
+  /** True when the function recorded a habit completion via record_habit_completion(). */
+  habit_confirmed: boolean;
+  /**
+   * Server-computed streak after a passing check-in; null otherwise. Set for both
+   * 'streak' proofs and 'habit' proofs — a verified habit is the day's check-in.
+   */
   streak: StreakState | null;
 }
 
@@ -53,11 +58,13 @@ function toBase64(file: File): Promise<{ base64: string; mimeType: string }> {
 
 export async function verifyProof(input: {
   file: File;
-  /** The goal or task label the photo is judged against. */
+  /** The goal, task, or habit label the photo is judged against. */
   context: string;
-  kind: 'streak' | 'task';
+  kind: 'streak' | 'task' | 'habit';
   /** Required for kind 'task' — the function ticks this on a pass. */
   taskId?: string;
+  /** Required for kind 'habit' — the function records a completion for this on a pass. */
+  habitId?: string;
 }): Promise<ProofResult> {
   try {
     const { base64, mimeType } = await toBase64(input.file);
@@ -69,6 +76,7 @@ export async function verifyProof(input: {
         context: input.context,
         kind: input.kind,
         task_id: input.taskId,
+        habit_id: input.habitId,
       },
     });
 
@@ -97,6 +105,7 @@ export async function verifyProof(input: {
           verdict: body.verdict,
           evaluation_text: body.evaluation_text,
           task_confirmed: body.task_confirmed,
+          habit_confirmed: body.habit_confirmed,
           streak: body.streak ?? null,
         },
       };

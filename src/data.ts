@@ -36,14 +36,6 @@ export interface CalDay {
   eventLabel?: string;
 }
 
-export interface TodayItem {
-  id: string;
-  icon: string;
-  label: string;
-  status: 'done' | 'elapsed' | 'pending';
-  meta: string;
-}
-
 export interface Deadline {
   id: string;
   title: string;
@@ -67,13 +59,6 @@ export interface ActivityItem {
   action: string;
   timestamp: string;
 }
-
-export const TODAY_ITEMS: TodayItem[] = [
-  { id: 't1', icon: 'Code2', label: 'Refactor auth middleware', status: 'elapsed', meta: '2h 14m' },
-  { id: 't2', icon: 'BookOpen', label: 'Read: SSE vs WebSockets', status: 'done', meta: 'Done · 18m' },
-  { id: 't3', icon: 'Dumbbell', label: 'Morning workout', status: 'done', meta: 'Done · 45m' },
-  { id: 't4', icon: 'PenLine', label: 'Daily journal', status: 'pending', meta: 'Pending' },
-];
 
 export const DEADLINES: Deadline[] = [
   { id: 'd1', title: 'Ship MVP v0.4 to beta cohort', daysLeft: 3, progress: 78, priority: 'Critical', icon: 'Rocket' },
@@ -118,13 +103,6 @@ export const BLUEPRINT_TRACKS: BlueprintTrack[] = [
   { id: 'bp1', category: 'RE Curriculum', completed: 8, total: 12, color: '#E8102A' },
   { id: 'bp2', category: 'AI Security Tooling', completed: 4, total: 10, color: '#F5A524' },
   { id: 'bp3', category: 'Web3 Track', completed: 2, total: 8, color: '#34D399' },
-];
-
-export const HABITS = [
-  { id: 'h1', icon: 'Dumbbell', label: 'Workout', done: true },
-  { id: 'h2', icon: 'Code2', label: 'Deep work block', done: true },
-  { id: 'h3', icon: 'BookOpen', label: 'Read 20 pages', done: false },
-  { id: 'h4', icon: 'Moon', label: 'Sleep by 11pm', done: false },
 ];
 
 // Build a 5x7 calendar grid for a given month

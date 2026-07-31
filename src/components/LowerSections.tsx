@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useState, FormEvent } from 'react';
-import { Rocket, Plus, X, Trash2, Pencil, Check } from 'lucide-react';
+import { Rocket, Plus, X, Trash2, Pencil, Check, ChevronDown } from 'lucide-react';
 import {
   Mission, loadMissions, createMission, updateMission, deleteMission,
   deadlineLabel, deadlineColor,
 } from '../lib/missions';
+import {
+  MissionPhase, PhaseStatus, loadPhases, createPhase, updatePhase, deletePhase, nextStatus,
+} from '../lib/missionPhases';
 
 /* ── Next Missions ──────────────────────────────────────────────────────── */
 /**
@@ -131,42 +134,269 @@ function MissionCard({ mission, busy, onEdit, onDelete }: {
   onDelete: () => void;
 }) {
   const color = deadlineColor(mission.deadline);
+  const [expanded, setExpanded] = useState(false);
 
   return (
-    <div className="glass glass-hover p-3.5 flex items-center gap-2.5 group">
-      <span
-        className="w-8 h-8 rounded-lg grid place-items-center shrink-0"
-        style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}
+    <div className="glass glass-hover p-3.5 flex flex-col gap-2.5 group">
+      <div className="flex items-center gap-2.5">
+        <button
+          onClick={() => setExpanded((v) => !v)}
+          title={expanded ? 'Hide phases' : 'Show phases'}
+          className="w-8 h-8 rounded-lg grid place-items-center shrink-0 transition hover:bg-white/10"
+          style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)' }}
+        >
+          {expanded
+            ? <ChevronDown className="w-3.5 h-3.5 text-white/70" />
+            : <Rocket className="w-3.5 h-3.5 text-white/70" />}
+        </button>
+
+        <button className="min-w-0 flex-1 text-left" onClick={() => setExpanded((v) => !v)}>
+          <h3 className="text-white text-xs font-semibold leading-snug line-clamp-1">{mission.title}</h3>
+          <span className="text-[10px] font-semibold" style={{ color }}>
+            {deadlineLabel(mission.deadline)}
+          </span>
+        </button>
+
+        <div className="flex gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition">
+          <button
+            onClick={onEdit}
+            disabled={busy}
+            title="Edit mission"
+            className="w-6 h-6 grid place-items-center rounded-md text-white/50 hover:text-white hover:bg-white/10 transition"
+          >
+            <Pencil className="w-3 h-3" />
+          </button>
+          <button
+            onClick={onDelete}
+            disabled={busy}
+            title="Delete mission"
+            className="w-6 h-6 grid place-items-center rounded-md text-white/50 hover:text-red-300 hover:bg-red-500/10 transition"
+          >
+            <Trash2 className="w-3 h-3" />
+          </button>
+        </div>
+      </div>
+
+      {expanded && <PhaseTimeline missionId={mission.id} />}
+    </div>
+  );
+}
+
+/* ── Phase timeline ─────────────────────────────────────────────────────────
+ * An expandable per-mission list of phases. Status is a single-click cycle
+ * (pending -> live -> completed) that writes through updatePhase; user_id / mission_id
+ * are never sent, so a phase cannot be reassigned or moved from here.
+ */
+const PHASE_COLORS: Record<PhaseStatus, string> = {
+  pending: 'rgba(255,255,255,0.25)',
+  live: 'var(--accent)',
+  completed: '#34D399',
+};
+
+function PhaseTimeline({ missionId }: { missionId: string }) {
+  const [phases, setPhases] = useState<MissionPhase[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [adding, setAdding] = useState(false);
+
+  const load = useCallback(async () => {
+    const { data, error: loadError } = await loadPhases(missionId);
+    if (loadError) { setError(loadError); setPhases([]); return; }
+    setPhases(data ?? []);
+  }, [missionId]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  async function run(action: () => Promise<{ error: string | null }>) {
+    setBusy(true);
+    setError(null);
+    const { error: actionError } = await action();
+    if (actionError) setError(actionError);
+    else await load();
+    setBusy(false);
+    return !actionError;
+  }
+
+  const nextOrder = phases && phases.length > 0
+    ? Math.max(...phases.map((p) => p.order_index)) + 1
+    : 0;
+
+  return (
+    <div className="pt-2.5 border-t border-white/5 flex flex-col gap-2">
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] tracked-sm text-white/40">PHASES</span>
+        <button
+          onClick={() => setAdding(true)}
+          className="text-[10px] text-white/50 hover:text-white transition flex items-center gap-1"
+        >
+          <Plus className="w-3 h-3" /> Add phase
+        </button>
+      </div>
+
+      {error && (
+        <div
+          className="flex items-start gap-2 text-[10px] rounded-lg px-2.5 py-1.5"
+          style={{ color: '#fca5a5', background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.30)' }}
+        >
+          <span className="flex-1">{error}</span>
+          <button onClick={() => setError(null)} style={{ color: 'inherit' }}><X className="w-3 h-3" /></button>
+        </div>
+      )}
+
+      {phases === null && <div className="text-[11px] text-white/30 py-1">Loading phases…</div>}
+
+      {phases && phases.length > 0 && (
+        <div className="relative flex flex-col gap-2 pl-1">
+          {/* the timeline rail */}
+          <span className="absolute left-[8px] top-1.5 bottom-1.5 w-px bg-white/10" />
+          {phases.map((p) => (
+            <PhaseRow
+              key={p.id}
+              phase={p}
+              busy={busy}
+              onCycle={() => run(() => updatePhase(p.id, { status: nextStatus(p.status) }))}
+              onDelete={() => run(() => deletePhase(p.id))}
+            />
+          ))}
+        </div>
+      )}
+
+      {phases && phases.length === 0 && !adding && (
+        <div className="text-[11px] text-white/35 py-1">No phases yet — break this mission into steps.</div>
+      )}
+
+      {adding && (
+        <PhaseForm
+          busy={busy}
+          onCancel={() => setAdding(false)}
+          onSubmit={async (values) => {
+            const ok = await run(() => createPhase({
+              missionId,
+              title: values.title,
+              targetDate: values.targetDate,
+              orderIndex: nextOrder,
+            }));
+            if (ok) setAdding(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function PhaseRow({ phase, busy, onCycle, onDelete }: {
+  phase: MissionPhase;
+  busy: boolean;
+  onCycle: () => void;
+  onDelete: () => void;
+}) {
+  const dotColor = PHASE_COLORS[phase.status];
+  const done = phase.status === 'completed';
+  const targetLabel = phase.target_date
+    ? new Date(`${phase.target_date}T00:00:00`).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+    : null;
+
+  return (
+    <div className="relative flex items-center gap-2.5 group/phase">
+      <button
+        onClick={onCycle}
+        disabled={busy}
+        title={`Status: ${phase.status} — click to advance`}
+        className="relative z-10 w-[17px] h-[17px] rounded-full grid place-items-center shrink-0 transition"
+        style={{
+          background: phase.status === 'pending' ? 'rgba(20,20,26,1)' : dotColor,
+          border: `1.5px solid ${phase.status === 'pending' ? 'rgba(255,255,255,0.25)' : dotColor}`,
+          boxShadow: phase.status === 'live' ? `0 0 8px -1px ${dotColor}` : undefined,
+        }}
       >
-        <Rocket className="w-3.5 h-3.5 text-white/70" />
-      </span>
+        {done && <Check className="w-2.5 h-2.5 text-black/80" />}
+      </button>
 
       <div className="min-w-0 flex-1">
-        <h3 className="text-white text-xs font-semibold leading-snug line-clamp-1">{mission.title}</h3>
-        <span className="text-[10px] font-semibold" style={{ color }}>
-          {deadlineLabel(mission.deadline)}
+        <span
+          className="text-[11px] leading-snug line-clamp-1"
+          style={{ color: done ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.85)', textDecoration: done ? 'line-through' : 'none' }}
+        >
+          {phase.title}
         </span>
       </div>
 
-      <div className="flex gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition">
+      {targetLabel && (
+        <span className="text-[9px] text-white/35 shrink-0">{targetLabel}</span>
+      )}
+
+      <button
+        onClick={onDelete}
+        disabled={busy}
+        title="Delete phase"
+        className="w-5 h-5 grid place-items-center rounded-md text-white/40 hover:text-red-300 hover:bg-red-500/10 transition shrink-0 opacity-0 group-hover/phase:opacity-100"
+      >
+        <Trash2 className="w-3 h-3" />
+      </button>
+    </div>
+  );
+}
+
+function PhaseForm({ busy, onCancel, onSubmit }: {
+  busy: boolean;
+  onCancel: () => void;
+  onSubmit: (values: { title: string; targetDate: string | null }) => void;
+}) {
+  const [title, setTitle] = useState('');
+  const [targetDate, setTargetDate] = useState('');
+
+  function submit(e: FormEvent) {
+    e.preventDefault();
+    if (!title.trim()) return;
+    onSubmit({ title, targetDate: targetDate || null });
+  }
+
+  const field: React.CSSProperties = {
+    background: 'rgba(255,255,255,0.05)',
+    border: '1px solid rgba(255,255,255,0.10)',
+    borderRadius: 8,
+    padding: '5px 8px',
+    color: '#fff',
+    fontSize: 11,
+    outline: 'none',
+  };
+
+  return (
+    <form onSubmit={submit} className="flex flex-col gap-2 pl-1">
+      <input
+        value={title}
+        onChange={(e) => setTitle(e.target.value.slice(0, 120))}
+        placeholder="Phase title"
+        autoFocus
+        style={field}
+      />
+      <div className="flex gap-2">
+        <input
+          type="date"
+          value={targetDate}
+          onChange={(e) => setTargetDate(e.target.value)}
+          style={{ ...field, flex: 1, colorScheme: 'dark' }}
+        />
         <button
-          onClick={onEdit}
-          disabled={busy}
-          title="Edit mission"
-          className="w-6 h-6 grid place-items-center rounded-md text-white/50 hover:text-white hover:bg-white/10 transition"
+          type="submit"
+          disabled={busy || !title.trim()}
+          title="Save phase"
+          className="w-7 h-7 grid place-items-center rounded-lg text-white transition hover:brightness-110 disabled:opacity-40"
+          style={{ background: 'var(--accent)' }}
         >
-          <Pencil className="w-3 h-3" />
+          <Check className="w-3 h-3" />
         </button>
         <button
-          onClick={onDelete}
-          disabled={busy}
-          title="Delete mission"
-          className="w-6 h-6 grid place-items-center rounded-md text-white/50 hover:text-red-300 hover:bg-red-500/10 transition"
+          type="button"
+          onClick={onCancel}
+          title="Cancel"
+          className="w-7 h-7 grid place-items-center rounded-lg text-white/60 transition hover:bg-white/10"
+          style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.10)' }}
         >
-          <Trash2 className="w-3 h-3" />
+          <X className="w-3 h-3" />
         </button>
       </div>
-    </div>
+    </form>
   );
 }
 

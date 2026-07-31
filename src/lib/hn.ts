@@ -125,6 +125,113 @@ async function fetchItem(id: number): Promise<RawItem | null> {
   }
 }
 
+/* ── Curated topic search (Algolia) ─────────────────────────────────────────
+ * The Firebase endpoints above return whatever is trending; these two home cards
+ * want a subject. Algolia's HN search supports query + tags + numericFilters on the
+ * same corpus, free and keyless, so no new data source is involved.
+ *
+ * Each topic fans out across several queries because one term is too narrow — a day
+ * with no "CVE" story still has "breach" and "exploit" stories. Results are merged,
+ * deduped by id, and sorted newest-first.
+ */
+
+const ALGOLIA = 'https://hn.algolia.com/api/v1/search_by_date';
+
+export type CuratedTopic = 'security' | 'industry';
+
+interface TopicSpec {
+  queries: string[];
+  /** Floor on points, to keep low-signal posts out. */
+  minPoints: number;
+}
+
+const TOPICS: Record<CuratedTopic, TopicSpec> = {
+  // Hacking / security.
+  security: {
+    queries: ['hacking', 'security breach', 'vulnerability', 'exploit', 'cyberattack', 'CVE'],
+    minPoints: 15,
+  },
+  // Major industry movement. Higher floor: these terms match a lot of small posts,
+  // and industry news that matters trends well above 30 anyway.
+  industry: {
+    queries: ['OpenAI', 'Google', 'Microsoft', 'Apple', 'AI', 'acquisition', 'funding', 'chip', 'regulation'],
+    minPoints: 30,
+  },
+};
+
+interface AlgoliaHit {
+  objectID: string;
+  title?: string;
+  url?: string | null;
+  points?: number;
+  num_comments?: number;
+  created_at_i?: number;
+  author?: string;
+}
+
+const curatedCache = new Map<CuratedTopic, { at: number; stories: Story[] }>();
+const curatedInFlight = new Map<CuratedTopic, Promise<Story[]>>();
+
+export async function fetchCurated(topic: CuratedTopic, count = 5): Promise<Story[]> {
+  const cached = curatedCache.get(topic);
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS && cached.stories.length >= count) {
+    return cached.stories.slice(0, count);
+  }
+
+  const pending = curatedInFlight.get(topic);
+  if (pending) {
+    const rows = await pending;
+    if (rows.length >= count) return rows.slice(0, count);
+  }
+
+  const request = loadCurated(topic).finally(() => { curatedInFlight.delete(topic); });
+  curatedInFlight.set(topic, request);
+  return (await request).slice(0, count);
+}
+
+async function loadCurated(topic: CuratedTopic): Promise<Story[]> {
+  const spec = TOPICS[topic];
+
+  const results = await Promise.all(
+    spec.queries.map(async (query): Promise<AlgoliaHit[]> => {
+      const url = `${ALGOLIA}?query=${encodeURIComponent(query)}`
+        + `&tags=story&numericFilters=${encodeURIComponent(`points>${spec.minPoints}`)}`
+        + '&hitsPerPage=8';
+      try {
+        const response = await fetch(url);
+        if (!response.ok) return [];
+        const body = await response.json();
+        return (body?.hits ?? []) as AlgoliaHit[];
+      } catch {
+        // One failing query shouldn't sink the topic.
+        return [];
+      }
+    }),
+  );
+
+  const byId = new Map<number, Story>();
+  for (const hit of results.flat()) {
+    if (!hit.title) continue;
+    const id = Number(hit.objectID);
+    if (!Number.isFinite(id) || byId.has(id)) continue;
+    byId.set(id, {
+      id,
+      title: hit.title,
+      url: hit.url ?? null,
+      score: hit.points ?? 0,
+      by: hit.author ?? 'unknown',
+      time: hit.created_at_i ?? 0,
+      descendants: hit.num_comments ?? 0,
+    });
+  }
+
+  const stories = [...byId.values()].sort((a, b) => b.time - a.time);
+  if (stories.length === 0) throw new Error('No matching stories right now');
+
+  curatedCache.set(topic, { at: Date.now(), stories });
+  return stories;
+}
+
 /** Discussion permalink — used when a story is a text post with no outbound url. */
 export function commentsUrl(id: number) {
   return `https://news.ycombinator.com/item?id=${id}`;

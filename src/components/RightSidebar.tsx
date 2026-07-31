@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
 import { Flame, Check, Circle, Camera, ArrowRight, Sparkles, ExternalLink } from 'lucide-react';
-import { Person, HABITS } from '../data';
+import { Person } from '../data';
+import { HabitToday, loadHabits, habitIcon } from '../lib/habits';
 import { ACCENTS } from '../theme';
-import { Story, fetchTopStories, commentsUrl, relativeTime, domainOf } from '../lib/hn';
+import { Story, CuratedTopic, fetchCurated, commentsUrl, relativeTime, domainOf } from '../lib/hn';
 
 interface Props {
   user: Person;
@@ -12,24 +13,18 @@ interface Props {
 
 export default function RightSidebar({ user, onOpenStreaks, onOpenTechFeed }: Props) {
   const accent = ACCENTS[user.accent];
+  const [habits, setHabits] = useState<HabitToday[]>([]);
+
+  useEffect(() => {
+    let mounted = true;
+    loadHabits().then(({ data }) => { if (mounted && data) setHabits(data); });
+    return () => { mounted = false; };
+  }, []);
+
   const ringPct = Math.min(user.streak / 60, 1);
   const r = 26;
   const circ = 2 * Math.PI * r;
   const offset = circ * (1 - ringPct);
-
-  // One fetch feeds both news panels; hn.ts dedupes concurrent callers.
-  const [stories, setStories] = useState<Story[] | null>(null);
-  const [newsError, setNewsError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let mounted = true;
-    fetchTopStories(6)
-      .then((rows) => { if (mounted) setStories(rows); })
-      .catch((e: unknown) => {
-        if (mounted) setNewsError(e instanceof Error ? e.message : 'Could not reach Hacker News');
-      });
-    return () => { mounted = false; };
-  }, []);
 
   return (
     <div className="flex flex-col gap-4">
@@ -59,19 +54,24 @@ export default function RightSidebar({ user, onOpenStreaks, onOpenTechFeed }: Pr
             />
           </svg>
         </div>
-        <div className="mt-3 pt-3 border-t border-white/5 flex flex-col gap-2">
-          {HABITS.slice(0, 3).map((h) => (
-            <div key={h.id} className="flex items-center gap-2 text-xs">
-              <span className="w-5 h-5 grid place-items-center rounded-md bg-white/5 text-white/60">
-                <Flame className="w-3 h-3" />
-              </span>
-              <span className="flex-1 text-white/70">{h.label}</span>
-              {h.done
-                ? <Check className="w-3.5 h-3.5" style={{ color: '#34D399' }} />
-                : <Circle className="w-3.5 h-3.5 text-white/20" />}
-            </div>
-          ))}
-        </div>
+        {habits.length > 0 && (
+          <div className="mt-3 pt-3 border-t border-white/5 flex flex-col gap-2">
+            {habits.slice(0, 3).map((h) => {
+              const Icon = habitIcon(h.icon);
+              return (
+                <div key={h.id} className="flex items-center gap-2 text-xs">
+                  <span className="w-5 h-5 grid place-items-center rounded-md bg-white/5 text-white/60">
+                    <Icon className="w-3 h-3" />
+                  </span>
+                  <span className="flex-1 text-white/70">{h.title}</span>
+                  {h.done_today
+                    ? <Check className="w-3.5 h-3.5" style={{ color: '#34D399' }} />
+                    : <Circle className="w-3.5 h-3.5 text-white/20" />}
+                </div>
+              );
+            })}
+          </div>
+        )}
         {/* Also the desktop entry point to Streaks, which no longer has a nav link. */}
         <button
           onClick={onOpenStreaks}
@@ -82,9 +82,9 @@ export default function RightSidebar({ user, onOpenStreaks, onOpenTechFeed }: Pr
         </button>
       </div>
 
-      {/* Live Hacker News — top story and runner-up */}
-      <NewsPanel title="Today's Tech" story={stories?.[0]} error={newsError} loading={!stories && !newsError} onSeeAll={onOpenTechFeed} />
-      <NewsPanel title="Industry Update" story={stories?.[1]} error={newsError} loading={!stories && !newsError} onSeeAll={onOpenTechFeed} />
+      {/* Curated Hacker News — each card searches its own subject */}
+      <NewsPanel title="Today's Tech" topic="security" onSeeAll={onOpenTechFeed} />
+      <NewsPanel title="Industry Update" topic="industry" onSeeAll={onOpenTechFeed} />
 
       {/* Insights — app-generated stats about your own work, not news */}
       <div className="glass p-4">
@@ -100,13 +100,25 @@ export default function RightSidebar({ user, onOpenStreaks, onOpenTechFeed }: Pr
   );
 }
 
-function NewsPanel({ title, story, loading, error, onSeeAll }: {
+function NewsPanel({ title, topic, onSeeAll }: {
   title: string;
-  story?: Story;
-  loading: boolean;
-  error: string | null;
+  topic: CuratedTopic;
   onSeeAll: () => void;
 }) {
+  const [story, setStory] = useState<Story | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    fetchCurated(topic, 1)
+      .then((rows) => { if (mounted) setStory(rows[0] ?? null); })
+      .catch((e: unknown) => {
+        if (mounted) setError(e instanceof Error ? e.message : 'Could not reach Hacker News');
+      });
+    return () => { mounted = false; };
+  }, [topic]);
+
+  const loading = !story && !error;
   const href = story ? (story.url ?? commentsUrl(story.id)) : null;
   const domain = story ? domainOf(story.url) : null;
 

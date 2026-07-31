@@ -1,29 +1,24 @@
-import { ChevronLeft, ChevronRight, Check, Clock, Circle } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Check, Circle } from 'lucide-react';
 import { useState, useEffect } from 'react';
-import { Person, TODAY_ITEMS, DEADLINES, buildDayStrip, MONTH_NAMES, CalDay } from '../data';
+import { Person, buildDayStrip, MONTH_NAMES, CalDay } from '../data';
+import { Mission, loadMissions, daysLeft } from '../lib/missions';
+import { HabitToday, loadHabits, habitIcon } from '../lib/habits';
 import { ACCENTS } from '../theme';
 import ThunderBackground from './SpiralBackground';
-import { supabase } from '../lib/supabase';
 
 interface Props { user: Person; }
-interface GoalDeadline { title: string; deadline: string; }
 
 const WARN = '#FF4D2E';
 const CELL_H = 44;
 const CELL_GAP = 5;
-
-function daysUntil(isoDate: string): number {
-  const d = new Date(isoDate); d.setHours(0,0,0,0);
-  const t = new Date(); t.setHours(0,0,0,0);
-  return Math.ceil((d.getTime() - t.getTime()) / 86400000);
-}
 
 export default function MissionHero({ user }: Props) {
   const accent = ACCENTS[user.accent];
   const now = new Date();
   const [year, setYear] = useState(now.getFullYear());
   const [month, setMonth] = useState(now.getMonth());
-  const [liveGoals, setLiveGoals] = useState<GoalDeadline[]>([]);
+  const [missions, setMissions] = useState<Mission[] | null>(null);
+  const [habits, setHabits] = useState<HabitToday[] | null>(null);
 
   const days = buildDayStrip(year, month);
   const todayDate = now.getDate();
@@ -38,20 +33,15 @@ export default function MissionHero({ user }: Props) {
   };
 
   useEffect(() => {
-    supabase
-      .from('goals')
-      .select('title, deadline')
-      .eq('status', 'active')
-      .not('deadline', 'is', null)
-      .order('deadline')
-      .limit(5)
-      .then(({ data }) => { if (data) setLiveGoals(data as GoalDeadline[]); });
+    let mounted = true;
+    loadMissions().then(({ data }) => { if (mounted && data) setMissions(data); });
+    loadHabits().then(({ data }) => { if (mounted) setHabits(data ?? []); });
+    return () => { mounted = false; };
   }, []);
 
-  // Combine live goals + static deadlines, take top 4 by urgency
-  const deadlineItems = liveGoals.length > 0
-    ? liveGoals
-    : DEADLINES.map(d => ({ title: d.title, deadline: new Date(Date.now() + d.daysLeft * 86400000).toISOString().split('T')[0] }));
+  // Real missions, nearest deadline first. loadMissions() already sorts; undated ones
+  // have nothing to count down to, so they are left out of this panel.
+  const deadlineItems = (missions ?? []).filter(m => m.deadline).slice(0, 5);
 
   return (
     <section className="glass" style={{ position: 'relative', padding: '22px 24px 26px' }}>
@@ -132,44 +122,58 @@ export default function MissionHero({ user }: Props) {
             </span>
           </div>
 
-          {/* Today's tasks */}
+          {/* Today's habits — real ticks from verified completions, not fixtures */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {TODAY_ITEMS.map((it) => (
-              <div key={it.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
-                <span style={{
-                  width: 20, height: 20, display: 'grid', placeItems: 'center',
-                  borderRadius: 6, flexShrink: 0,
-                  background: 'rgba(255,255,255,0.05)',
-                  color: it.status === 'done' ? '#34D399' : 'rgba(255,255,255,0.55)',
-                }}>
-                  {it.status === 'done' ? <Check className="w-3 h-3" />
-                    : it.status === 'elapsed' ? <Clock className="w-3 h-3" />
-                    : <Circle className="w-3 h-3" />}
-                </span>
-                <span style={{ flex: 1, color: 'rgba(255,255,255,0.75)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {it.label}
-                </span>
-                <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.38)', flexShrink: 0 }}>{it.meta}</span>
-              </div>
-            ))}
+            {habits === null && (
+              <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>Loading…</div>
+            )}
+            {habits !== null && habits.length === 0 && (
+              <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>No habits yet.</div>
+            )}
+            {(habits ?? []).map((h) => {
+              const Icon = habitIcon(h.icon);
+              return (
+                <div key={h.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                  <span style={{
+                    width: 20, height: 20, display: 'grid', placeItems: 'center',
+                    borderRadius: 6, flexShrink: 0,
+                    background: 'rgba(255,255,255,0.05)',
+                    color: h.done_today ? '#34D399' : 'rgba(255,255,255,0.55)',
+                  }}>
+                    {h.done_today ? <Check className="w-3 h-3" /> : <Icon className="w-3 h-3" />}
+                  </span>
+                  <span style={{ flex: 1, color: 'rgba(255,255,255,0.75)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {h.title}
+                  </span>
+                  {h.done_today
+                    ? <Check className="w-3 h-3" style={{ color: '#34D399', flexShrink: 0 }} />
+                    : <Circle className="w-3 h-3" style={{ color: 'rgba(255,255,255,0.25)', flexShrink: 0 }} />}
+                </div>
+              );
+            })}
           </div>
 
-          {/* XP */}
-          <div style={{ display: 'flex', justifyContent: 'space-between', paddingTop: 6, borderTop: '1px solid rgba(255,255,255,0.06)', fontSize: 11 }}>
-            <span style={{ color: 'rgba(255,255,255,0.4)' }}>XP today</span>
-            <span style={{ fontWeight: 700, color: accent.hex }}>+340</span>
-          </div>
-
-          {/* Deadlines (live from Goals or static) */}
+          {/* Deadlines — real missions, nearest first */}
           <div style={{ paddingTop: 4 }}>
             <div style={{ fontSize: 9, letterSpacing: '0.12em', color: 'rgba(255,255,255,0.38)', marginBottom: 8 }}>DEADLINES</div>
-            {deadlineItems.map((d, i) => {
-              const days = daysUntil(d.deadline);
-              const color = days <= 3 ? '#FF4D2E' : days <= 7 ? '#FF8A1E' : 'rgba(255,255,255,0.55)';
+            {missions === null && (
+              <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>Loading…</div>
+            )}
+            {missions !== null && deadlineItems.length === 0 && (
+              <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>
+                No missions with a deadline yet.
+              </div>
+            )}
+            {deadlineItems.map((m) => {
+              const days = daysLeft(m.deadline) ?? 0;
+              const color = days < 0 ? '#FF4D2E'
+                : days <= 3 ? '#FF4D2E'
+                : days <= 7 ? '#FF8A1E'
+                : 'rgba(255,255,255,0.55)';
               return (
-                <div key={i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <div key={m.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
                   <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.65)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', paddingRight: 8 }}>
-                    {d.title}
+                    {m.title}
                   </span>
                   <span style={{ fontSize: 10, fontWeight: 600, color, flexShrink: 0 }}>{days}d</span>
                 </div>

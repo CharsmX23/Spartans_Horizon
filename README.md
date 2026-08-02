@@ -1,134 +1,71 @@
-# Spartans_Horizon
+Event Horizon — Spartans_Horizon
 
-[![Open in Bolt](https://bolt.new/static/open-in-bolt.svg)](https://bolt.new/~/sb1-xfp2caqp)
+A squad-based hackathon and learning journal. Track projects and deadlines, build learning paths with AI-generated syllabi, and keep a daily proof-of-work streak verified by AI photo evaluation — all with lightweight username/password auth, no heavy OAuth.
 
-A squad-based hackathon & learning-journal app: personal journals, shared project
-deadlines, a calendar, daily streaks, and AI-generated learning paths.
+Built for a small squad (up to a handful of people) working through hackathons and self-directed learning together, with real accountability instead of a to-do list nobody checks.
 
-React + Vite + Tailwind on the frontend, Supabase (Postgres, Auth, Storage, Edge
-Functions) on the backend.
+Tech Stack
+Frontend: React 18, Vite 5, TypeScript, Tailwind CSS 3
+Backend: Supabase — Postgres, Auth, Storage, Edge Functions
+AI verification: Google Gemini (photo-based proof evaluation, pinned model version so the judging model can't silently change underneath you)
+Tech feed: Hacker News — official Firebase API for the general feed, Algolia Search API for curated hacking/security and tech-industry stories (both free, no API key required)
+Setup
+Clone and install
+bash
+   git clone https://github.com/CharsmX23/Spartans_Horizon.git
+   cd Spartans_Horizon
+   npm install
+Environment variables
+bash
+   cp .env.example .env
 
-## Setup
+Fill in the two values from your Supabase project (Settings → API):
 
-### 1. Install
+   VITE_SUPABASE_URL=https://your-project-ref.supabase.co
+   VITE_SUPABASE_ANON_KEY=your-anon-public-key
 
-```bash
-npm install
-```
+Restart the dev server after editing .env — Vite only reads it at startup.
 
-### 2. Environment
+Apply database migrations Migrations currently live in supabase/migrations/ and are applied by pasting each file into the Supabase SQL Editor, in filename/chronological order, and running it. (Migration tracking via supabase db push is a planned improvement — see Known Open Items.) After applying, if a table or function 404s unexpectedly, reload the schema cache:
+sql
+   NOTIFY pgrst, 'reload schema';
+⚠️ Turn off "Confirm email" — required, not optional Auth uses a synthetic-email pattern (username@spartans.local) so real usernames work without a mailbox. These addresses can never receive mail, so if email confirmation is left on, every signup will either silently fail to return a session or hit an email-rate-limit error — with no obvious error pointing at the real cause. Supabase dashboard → Authentication → Sign In / Providers → Email → turn off "Confirm email." (Leave the Email provider itself enabled — you're disabling confirmation, not sign-in.)
+Set up the Gemini API key (required for AI photo verification) Get a key from aistudio.google.com, then store it as a Supabase Edge Function secret — never in .env, since anything VITE_-prefixed ends up in the browser bundle.
+bash
+   npx supabase secrets set GEMINI_API_KEY=your-key-here
+   npx supabase functions deploy verify-proof
+Run it
+bash
+   npm run dev
+Features
+Auth & Squads — username + password only. Accounts create or join a squad via a 6-character join code (readable alphabet — excludes 0/O/1/I/L to avoid misreads on a code that's read aloud).
+Missions — private, user-owned hackathon/project entries with deadlines and live countdowns. Each mission expands into a phase timeline (pending → live → completed) you build by hand.
+Power Up (Learning Paths) — user-built learning paths with modules and checkbox tasks. Task completion is verified by AI photo proof, not just self-reported.
+Habits & Streaks — daily habits (seeded with starter defaults) tracked via AI-verified photo proof. A verified habit completion also advances the day's streak, once per day regardless of how many habits you complete.
+AI Photo Verification — a shared verification engine powers streaks, habits, and learning-task proof. Photos are sent as base64 directly to a Supabase Edge Function, evaluated in memory by Gemini, and never written to storage or any database table — only the pass/fail verdict and evaluation text persist.
+Tech Feed — two home-screen cards curated for hacking/security and major tech industry news (via Algolia keyword + points filtering, not a random grab-bag), plus a full feed page with Top/New/Show HN/Ask HN tabs.
 
-```bash
-cp .env.example .env
-```
+(Journaling and Startup Ideas were removed — an intentional scope cut, not a missing feature.)
 
-Fill in both values from **Supabase Dashboard → Project Settings → API**:
+Architecture Notes
+Nothing security-relevant is client-writable. Streak counts, task completion, squad membership, and habit verification all go through SECURITY DEFINER Postgres functions (create_squad, join_squad, set_task_done, record_checkin, record_habit_completion) rather than direct table writes. Column-level grants restrict exactly what an authenticated user can touch directly — verified via has_column_privilege checks after every schema change, not assumed.
+No image storage, anywhere. All AI-verified photos are processed in memory and discarded. This is a deliberate privacy choice, not a missing feature.
+Known Open Items
 
-| Variable | Where to find it |
-| --- | --- |
-| `VITE_SUPABASE_URL` | Project URL |
-| `VITE_SUPABASE_ANON_KEY` | `anon` / `public` key |
+Kept honest on purpose — this app doesn't fake progress, and neither should this list:
 
-The `VITE_` prefix is required — Vite only exposes prefixed variables to client code.
-Restart the dev server after editing `.env`; Vite reads it at startup, not per request.
+streak_logs.verified may still be client-writable. This is the last known potentially-forgeable path in the app (everything else — current_streak, learning_tasks.is_done, habit_completions — is locked down). Confirm current status with a privilege check before treating streaks as fully tamper-proof:
+sql
+  SELECT has_column_privilege('authenticated','public.streak_logs','verified','UPDATE');
+  -- should be false
+Migration tracking (supabase db push) is not yet set up. Migrations have been applied by hand (SQL Editor / MCP) for the life of the project so far, which has already caused at least one migration to silently not land. Setting up tracked migrations is a priority before adding more schema changes.
+Goals page — verify "Add" is functional before relying on it; this was an open bug as of the last check.
+Contributing / Working On This
+Treat every schema change as a real migration: write it, review the actual SQL, apply it deliberately, then verify with a privilege/grant check — not just "it ran without error."
+Don't fake AI states. If a verification pipeline isn't wired up yet, show an honest "not yet connected" state rather than a fake success animation.
+If you drop a table or column, back up first — some of this data (journal entries, in the past) is not recoverable once gone.
 
-Only put publishable values here. Everything in the client bundle is public, so model
-and API keys belong in Edge Function secrets (`supabase secrets set ...`) instead.
-
-### 3. Run the migrations
-
-Apply the files in `supabase/migrations/` **in filename order** — the timestamps sort
-chronologically, and the order matters:
-
-1. `20260719114729_create_spartan_core_tables.sql` — journal, skills, goals, streak logs
-2. `20260720000000_create_profile_settings.sql` — creates the table step 3 alters
-3. `20260720170623_..._fix_rls_security_issues.sql.sql` — owner-scoped RLS
-4. `20260727120000_create_squads_and_users.sql` — squads, users, signup trigger, RPCs
-
-Step 3 fails if step 2 hasn't run.
-
-**Dashboard (simplest for a fresh project):** SQL Editor → New query → paste one file →
-Run → repeat in order.
-
-**CLI (alternative):**
-
-```bash
-npx supabase init          # only if supabase/config.toml doesn't exist yet
-npx supabase link --project-ref <your-project-ref>
-npx supabase db push
-```
-
-### 4. Turn OFF email confirmation ⚠️
-
-**Dashboard → Authentication → Sign In / Providers → Email → disable "Confirm email".**
-
-This one is not optional and cannot be done in a migration.
-
-Auth is username + password only. A username is mapped onto a synthetic address
-(`<username>@spartans.local`) so Supabase Auth still handles sessions and password
-hashing — but that address can never receive mail. With "Confirm email" on, every
-signup returns **no session**, the user appears to sign up successfully and then lands
-back on the login screen, and the account can never be verified. There is no error
-message pointing at this.
-
-While you're in Auth settings, keep the minimum password length at **6** to match the
-signup form's `minLength`.
-
-### 5. Deploy the photo-verification Edge Function
-
-Photo proofs (streak check-ins and learning-task proofs) are judged by Gemini inside the
-`verify-proof` Edge Function. The image is sent as base64, held in memory, and discarded
-— it is never written to Storage or to a table, so there is no cleanup that can fail.
-
-```bash
-npx supabase login
-npx supabase link --project-ref <your-project-ref>
-npx supabase functions deploy verify-proof
-```
-
-Or skip linking and target the project directly:
-
-```bash
-npx supabase functions deploy verify-proof --project-ref <your-project-ref>
-```
-
-The function reads `GEMINI_API_KEY` from Edge Function secrets:
-
-```bash
-npx supabase secrets set GEMINI_API_KEY=... --project-ref <your-project-ref>
-npx supabase secrets list --project-ref <your-project-ref>   # confirm the name
-```
-
-**Leave JWT verification ON** (the default — nothing to change in the dashboard). The
-function forwards the caller's token to `set_task_done()` so `auth.uid()` resolves and
-the task's ownership check still applies. Turning it off would let anyone invoke the
-function with the public anon key and burn your Gemini quota.
-
-Logs: `npx supabase functions logs verify-proof`. They deliberately record status codes
-and error messages only — never the image payload.
-
-### 6. Start
-
-```bash
-npm run dev
-```
-
-Sign up → create a squad (or join one with a 6-character code) → you're in. The squad's
-join code is shown in Settings.
-
-## Commands
-
-```bash
-npm run dev        # dev server
-npm run build      # production build
-npm run preview    # serve the build
-npm run lint       # eslint
-npm run typecheck  # tsc --noEmit
-```
-
-## Notes
-
-- Free Supabase projects pause after ~7 days without API requests. Keep the project warm
+"Discipline compounds." — Event Horizonse after ~7 days without API requests. Keep the project warm
   with a scheduled ping if it needs to stay reachable.
 - There is no password reset or email verification flow, by design — usernames have no
   real mailbox behind them.

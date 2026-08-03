@@ -4,6 +4,8 @@ import Sidebar, { TabKey } from './components/Sidebar';
 import MissionHero from './components/MissionHero';
 import RightSidebar from './components/RightSidebar';
 import { NextMissions } from './components/LowerSections';
+import { GoalsSummary } from './components/GoalsSummary';
+import CursorGlow from './components/CursorGlow';
 import SettingsPanel from './components/SettingsPanel';
 import MobileTabBar from './components/MobileTabBar';
 import StreaksPage from './components/StreaksPage';
@@ -19,6 +21,8 @@ import { AuthProvider, useAuth } from './lib/auth';
 function App() {
   return (
     <AuthProvider>
+      {/* Fixed + pointer-events:none, so it sits outside every layout and gate. */}
+      <CursorGlow />
       <AppShell />
     </AuthProvider>
   );
@@ -92,6 +96,7 @@ function AppShell() {
             <div className="flex-1 min-w-0 flex flex-col gap-3">
               <MissionHero user={user} />
               <NextMissions compact />
+              <GoalsSummary onViewAll={() => setTab('goals')} />
             </div>
             <div className="hidden xl:flex flex-col gap-3 w-[280px] shrink-0 overflow-y-auto">
               <RightSidebar

@@ -99,8 +99,19 @@ export async function createHabit(input: {
   return { data: (data as Habit) ?? null, error: error?.message ?? null };
 }
 
-/** Archive rather than hard-delete when a habit has history worth keeping; callers that
- *  want it gone entirely use deleteHabit. */
+/** Every habit, removed ones included — the manage view needs to offer them back.
+ *  Active first, then the same ordering the daily list uses. */
+export async function loadAllHabits(): Promise<Result<Habit[]>> {
+  const { data, error } = await supabase
+    .from('habits')
+    .select('id, title, icon, active, sort_order')
+    .order('active', { ascending: false })
+    .order('sort_order', { ascending: true })
+    .order('created_at', { ascending: true });
+
+  return { data: (data as Habit[]) ?? null, error: error?.message ?? null };
+}
+
 export async function updateHabit(
   id: string,
   patch: { title?: string; icon?: string; active?: boolean; sort_order?: number },
@@ -115,6 +126,26 @@ export async function updateHabit(
   return { data: null, error: error?.message ?? null };
 }
 
+/**
+ * Removing a habit is a soft hide, not a delete: `active = false` takes it out of the
+ * daily list and out of record_habit_completion(), which validates `AND active` before
+ * writing, so the block is enforced server-side rather than by the UI omitting a row.
+ * Restoring is the same call with true.
+ */
+export async function setHabitActive(id: string, active: boolean): Promise<Result<null>> {
+  return updateHabit(id, { active });
+}
+
+/**
+ * Hard delete — deliberately not wired to any UI.
+ *
+ * habit_completions references (id, user_id) ON DELETE CASCADE, so this erases every
+ * verified completion for the habit along with the model's evaluation text. The user's
+ * streak counter and streak_logs survive (different tables), which makes the loss easy
+ * to miss: the days stay on the grid, the proof behind them does not. `authenticated`
+ * has no DELETE grant on habit_completions, so this cascade is the only way a client
+ * can destroy that history — use setHabitActive(id, false) instead.
+ */
 export async function deleteHabit(id: string): Promise<Result<null>> {
   const { error } = await supabase.from('habits').delete().eq('id', id);
   return { data: null, error: error?.message ?? null };

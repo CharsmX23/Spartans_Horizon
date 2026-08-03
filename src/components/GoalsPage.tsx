@@ -1,18 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Plus, X, Target, CheckCircle, Clock, Pause, Trash2 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
-
-interface Goal {
-  id: string;
-  title: string;
-  goal_type: 'long_term' | 'short_term';
-  deadline: string | null;
-  status: 'active' | 'completed' | 'paused';
-  description: string | null;
-  created_at: string;
-}
-
-type GoalType = 'long_term' | 'short_term';
+import { Goal, GoalType, GOAL_TYPE_COLOR } from '../lib/goals';
 
 function daysUntil(isoDate: string | null): number | null {
   if (!isoDate) return null;
@@ -48,12 +37,14 @@ export default function GoalsPage() {
   const [fDesc, setFDesc] = useState('');
   const [fDeadline, setFDeadline] = useState('');
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => { load(); }, []);
 
   async function load() {
     setLoading(true);
-    const { data } = await supabase.from('goals').select('*').order('deadline', { ascending: true, nullsFirst: false });
+    const { data, error: loadError } = await supabase.from('goals').select('*').order('deadline', { ascending: true, nullsFirst: false });
+    if (loadError) setError(loadError.message);
     if (data) setGoals(data as Goal[]);
     setLoading(false);
   }
@@ -67,11 +58,18 @@ export default function GoalsPage() {
   async function addGoal() {
     if (!fTitle.trim()) return;
     setSaving(true);
-    const { data } = await supabase
+    setError(null);
+    const { data, error: insertError } = await supabase
       .from('goals')
       .insert({ title: fTitle.trim(), goal_type: modalType, deadline: fDeadline || null, description: fDesc || null, status: 'active' })
       .select('*')
       .single();
+    if (insertError) {
+      // Keep the modal open on failure — closing it made a rejected write look like success.
+      setError(insertError.message);
+      setSaving(false);
+      return;
+    }
     if (data) setGoals(prev => [...prev, data as Goal].sort((a, b) => {
       if (!a.deadline && !b.deadline) return 0;
       if (!a.deadline) return 1;
@@ -84,12 +82,14 @@ export default function GoalsPage() {
 
   async function cycleStatus(goal: Goal) {
     const next = STATUS_CYCLE[goal.status];
-    await supabase.from('goals').update({ status: next }).eq('id', goal.id);
+    const { error: updateError } = await supabase.from('goals').update({ status: next }).eq('id', goal.id);
+    if (updateError) { setError(updateError.message); return; }
     setGoals(prev => prev.map(g => g.id === goal.id ? { ...g, status: next } : g));
   }
 
   async function deleteGoal(id: string) {
-    await supabase.from('goals').delete().eq('id', id);
+    const { error: deleteError } = await supabase.from('goals').delete().eq('id', id);
+    if (deleteError) { setError(deleteError.message); return; }
     setGoals(prev => prev.filter(g => g.id !== id));
   }
 
@@ -112,7 +112,7 @@ export default function GoalsPage() {
           <GoalColumn
             title="Long-Term Goals"
             subtitle="Vision · Milestones · Years"
-            accent="#38BDF8"
+            accent={GOAL_TYPE_COLOR.long_term}
             goals={longGoals}
             onAdd={() => openModal('long_term')}
             onCycle={cycleStatus}
@@ -121,12 +121,25 @@ export default function GoalsPage() {
           <GoalColumn
             title="Short-Term Goals"
             subtitle="This week · This sprint"
-            accent="#34D399"
+            accent={GOAL_TYPE_COLOR.short_term}
             goals={shortGoals}
             onAdd={() => openModal('short_term')}
             onCycle={cycleStatus}
             onDelete={deleteGoal}
           />
+        </div>
+      )}
+
+      {error && (
+        <div style={{
+          display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 14,
+          fontSize: 12, color: '#fca5a5', background: 'rgba(239,68,68,0.10)',
+          border: '1px solid rgba(239,68,68,0.30)', borderRadius: 10, padding: '8px 12px',
+        }}>
+          <span style={{ flex: 1 }}>{error}</span>
+          <button onClick={() => setError(null)} style={{ background: 'none', border: 'none', color: '#fca5a5', cursor: 'pointer' }}>
+            <X className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
 

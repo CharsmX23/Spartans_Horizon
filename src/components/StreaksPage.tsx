@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
-import { Flame, Upload, CheckCircle, XCircle, Zap } from 'lucide-react';
+import { Flame, Upload, CheckCircle, XCircle, Zap, Pencil, EyeOff, Check, SlidersHorizontal } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { verifyProof, validateProofFile } from '../lib/proof';
-import { loadHabits, verifyHabit, habitIcon, HabitToday } from '../lib/habits';
+import { loadHabits, verifyHabit, habitIcon, updateHabit, setHabitActive, HabitToday } from '../lib/habits';
+import HabitManager from './HabitManager';
 import { useAuth } from '../lib/auth';
 import { ACCENTS } from '../theme';
 import { Person } from '../data';
@@ -42,6 +43,8 @@ export default function StreaksPage({ user }: Props) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [managing, setManaging] = useState(false);
+  const [habitError, setHabitError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   // Authoritative value from users.current_streak, maintained by record_checkin().
@@ -85,6 +88,20 @@ export default function StreaksPage({ user }: Props) {
   function selectTarget(next: Target) {
     setTarget(next);
     resetUpload();
+  }
+
+  /**
+   * Habit edits from the row controls. Removal is `active = false` — habit_completions
+   * cascades off habits, so a real delete would take the verified proof history with
+   * it. refreshHabits() drops a removed habit from the list and, because it can no
+   * longer be found there, resets the upload target back to daily progress.
+   */
+  async function runHabitAction(action: () => Promise<{ error: string | null }>) {
+    setHabitError(null);
+    const { error: actionError } = await action();
+    if (actionError) { setHabitError(actionError); return false; }
+    await refreshHabits();
+    return true;
   }
 
   function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
@@ -179,65 +196,65 @@ export default function StreaksPage({ user }: Props) {
         </div>
       </div>
 
-      {/* ── Today's Habits ── real ticks, driven by verified completions ── */}
-      {habits.length > 0 && (
-        <div className="glass p-5 flex flex-col gap-3">
+      {/* ── Today's Habits ── real ticks, driven by verified completions ──
+          loadHabits() already filters active = true, so removed habits never appear. */}
+      <div className="glass p-5 flex flex-col gap-3">
+        <div className="flex items-center justify-between">
           <div style={{ fontSize: 11, letterSpacing: '0.12em', color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase' }}>
             Today's Habits
           </div>
-          <div className="flex flex-col gap-2">
-            {habits.map((h) => {
-              const Icon = habitIcon(h.icon);
-              const selected = target.kind === 'habit' && target.habit.id === h.id;
-              return (
-                <div
-                  key={h.id}
-                  className="flex items-center gap-3 rounded-xl px-3 py-2.5"
-                  style={{
-                    background: selected ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.02)',
-                    border: `1px solid ${selected ? `${accent.hex}55` : 'rgba(255,255,255,0.07)'}`,
-                  }}
-                >
-                  <span
-                    className="w-8 h-8 grid place-items-center rounded-lg shrink-0"
-                    style={{
-                      background: h.done_today ? `${accent.hex}22` : 'rgba(255,255,255,0.05)',
-                      color: h.done_today ? accent.hex : 'rgba(255,255,255,0.6)',
-                    }}
-                  >
-                    <Icon className="w-4 h-4" />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div style={{ color: '#fff', fontSize: 13, fontWeight: 600 }}>{h.title}</div>
-                    {h.done_today && h.today_note && (
-                      <div style={{ color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 2, fontStyle: 'italic' }} className="line-clamp-1">
-                        "{h.today_note}"
-                      </div>
-                    )}
-                  </div>
-                  {h.done_today ? (
-                    <span className="flex items-center gap-1 shrink-0" style={{ color: '#34D399', fontSize: 12, fontWeight: 600 }}>
-                      <CheckCircle className="w-4 h-4" /> Done
-                    </span>
-                  ) : (
-                    <button
-                      onClick={() => selectTarget({ kind: 'habit', habit: h })}
-                      className="shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold transition hover:brightness-110"
-                      style={{
-                        background: selected ? accent.hex : 'rgba(255,255,255,0.06)',
-                        color: selected ? '#fff' : 'rgba(255,255,255,0.8)',
-                        border: selected ? 'none' : '1px solid rgba(255,255,255,0.10)',
-                      }}
-                    >
-                      {selected ? 'Selected' : 'Prove'}
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+          <button
+            onClick={() => setManaging(true)}
+            className="flex items-center gap-1.5 text-[11px] text-white/45 hover:text-white transition"
+          >
+            <SlidersHorizontal className="w-3 h-3" /> Manage
+          </button>
         </div>
-      )}
+
+        {habitError && (
+          <div style={{
+            display: 'flex', alignItems: 'flex-start', gap: 8,
+            fontSize: 11, color: '#fca5a5', background: 'rgba(239,68,68,0.10)',
+            border: '1px solid rgba(239,68,68,0.30)', borderRadius: 10, padding: '7px 11px',
+          }}>
+            <span style={{ flex: 1 }}>{habitError}</span>
+            <button onClick={() => setHabitError(null)} style={{ background: 'none', border: 'none', color: '#fca5a5', cursor: 'pointer' }}>
+              <XCircle className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
+        {habits.length === 0 ? (
+          <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.3)' }}>
+            No active habits —{' '}
+            <button onClick={() => setManaging(true)} className="underline underline-offset-2 hover:text-white/70 transition">
+              add one
+            </button>
+            {' '}to start proving them daily.
+          </div>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {habits.map((h) => (
+              <HabitRow
+                key={h.id}
+                habit={h}
+                accent={accent.hex}
+                selected={target.kind === 'habit' && target.habit.id === h.id}
+                onSelect={() => selectTarget({ kind: 'habit', habit: h })}
+                onRename={(title) => runHabitAction(() => updateHabit(h.id, { title }))}
+                onRemove={() => runHabitAction(() => setHabitActive(h.id, false))}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      <HabitManager
+        open={managing}
+        accent={accent.hex}
+        onClose={() => setManaging(false)}
+        onChanged={() => { void refreshHabits(); }}
+      />
 
       {/* ── Upload Proof ── targeted at the streak or a chosen habit ── */}
       <div className="glass p-6 flex flex-col items-center gap-5">
@@ -424,6 +441,160 @@ export default function StreaksPage({ user }: Props) {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * One habit in today's list. The icon / title / Prove layout is unchanged; the edit and
+ * remove controls sit between the title and the Prove button and only appear on hover,
+ * the same pattern MissionCard uses, so the resting row looks exactly as it did.
+ *
+ * Remove is a hide, and the confirm copy says so — the row's completions survive it.
+ */
+function HabitRow({ habit, accent, selected, onSelect, onRename, onRemove }: {
+  habit: HabitToday;
+  accent: string;
+  selected: boolean;
+  onSelect: () => void;
+  onRename: (title: string) => Promise<boolean>;
+  onRemove: () => Promise<boolean>;
+}) {
+  const [mode, setMode] = useState<'view' | 'edit' | 'confirm'>('view');
+  const [draft, setDraft] = useState(habit.title);
+  const Icon = habitIcon(habit.icon);
+
+  const shell: React.CSSProperties = {
+    background: selected ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.02)',
+    border: `1px solid ${selected ? `${accent}55` : 'rgba(255,255,255,0.07)'}`,
+  };
+
+  if (mode === 'confirm') {
+    return (
+      <div className="flex flex-col gap-2 rounded-xl px-3 py-2.5" style={shell}>
+        <div style={{ color: 'rgba(255,255,255,0.85)', fontSize: 12 }}>
+          Remove “{habit.title}”?
+        </div>
+        <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: 11 }}>
+          Your past proof history stays intact — restore it any time from Manage.
+        </div>
+        <div className="flex gap-2 justify-end">
+          <button
+            onClick={() => setMode('view')}
+            className="px-3 py-1.5 rounded-lg text-xs transition hover:bg-white/10"
+            style={{ background: 'rgba(255,255,255,0.06)', color: 'rgba(255,255,255,0.7)', border: '1px solid rgba(255,255,255,0.10)' }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => { void onRemove(); }}
+            className="px-3 py-1.5 rounded-lg text-xs font-semibold transition hover:brightness-110"
+            style={{ background: 'rgba(239,68,68,0.16)', color: '#fca5a5', border: '1px solid rgba(239,68,68,0.35)' }}
+          >
+            Remove
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-3 rounded-xl px-3 py-2.5 group/habit" style={shell}>
+      <span
+        className="w-8 h-8 grid place-items-center rounded-lg shrink-0"
+        style={{
+          background: habit.done_today ? `${accent}22` : 'rgba(255,255,255,0.05)',
+          color: habit.done_today ? accent : 'rgba(255,255,255,0.6)',
+        }}
+      >
+        <Icon className="w-4 h-4" />
+      </span>
+
+      {mode === 'edit' ? (
+        <input
+          value={draft}
+          autoFocus
+          onChange={(e) => setDraft(e.target.value.slice(0, 80))}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && draft.trim()) { void onRename(draft).then(() => setMode('view')); }
+            if (e.key === 'Escape') { setDraft(habit.title); setMode('view'); }
+          }}
+          className="min-w-0 flex-1"
+          style={{
+            background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.14)',
+            borderRadius: 8, padding: '5px 9px', color: '#fff', fontSize: 13,
+            outline: 'none', fontFamily: 'inherit',
+          }}
+        />
+      ) : (
+        <div className="min-w-0 flex-1">
+          <div style={{ color: '#fff', fontSize: 13, fontWeight: 600 }}>{habit.title}</div>
+          {habit.done_today && habit.today_note && (
+            <div style={{ color: 'rgba(255,255,255,0.5)', fontSize: 11, marginTop: 2, fontStyle: 'italic' }} className="line-clamp-1">
+              "{habit.today_note}"
+            </div>
+          )}
+        </div>
+      )}
+
+      {mode === 'edit' ? (
+        <div className="flex gap-1 shrink-0">
+          <button
+            onClick={() => { if (draft.trim()) void onRename(draft).then(() => setMode('view')); }}
+            disabled={!draft.trim()}
+            title="Save name"
+            className="w-7 h-7 grid place-items-center rounded-md text-white transition hover:brightness-110 disabled:opacity-40"
+            style={{ background: accent }}
+          >
+            <Check className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={() => { setDraft(habit.title); setMode('view'); }}
+            title="Cancel"
+            className="w-7 h-7 grid place-items-center rounded-md text-white/60 transition hover:bg-white/10"
+            style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.10)' }}
+          >
+            <XCircle className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      ) : (
+        <>
+          <div className="flex gap-1 shrink-0 opacity-0 group-hover/habit:opacity-100 focus-within:opacity-100 transition">
+            <button
+              onClick={() => { setDraft(habit.title); setMode('edit'); }}
+              title="Rename habit"
+              className="w-6 h-6 grid place-items-center rounded-md text-white/45 hover:text-white hover:bg-white/10 transition"
+            >
+              <Pencil className="w-3 h-3" />
+            </button>
+            <button
+              onClick={() => setMode('confirm')}
+              title="Remove habit"
+              className="w-6 h-6 grid place-items-center rounded-md text-white/45 hover:text-red-300 hover:bg-red-500/10 transition"
+            >
+              <EyeOff className="w-3 h-3" />
+            </button>
+          </div>
+
+          {habit.done_today ? (
+            <span className="flex items-center gap-1 shrink-0" style={{ color: '#34D399', fontSize: 12, fontWeight: 600 }}>
+              <CheckCircle className="w-4 h-4" /> Done
+            </span>
+          ) : (
+            <button
+              onClick={onSelect}
+              className="shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold transition hover:brightness-110"
+              style={{
+                background: selected ? accent : 'rgba(255,255,255,0.06)',
+                color: selected ? '#fff' : 'rgba(255,255,255,0.8)',
+                border: selected ? 'none' : '1px solid rgba(255,255,255,0.10)',
+              }}
+            >
+              {selected ? 'Selected' : 'Prove'}
+            </button>
+          )}
+        </>
+      )}
     </div>
   );
 }

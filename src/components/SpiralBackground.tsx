@@ -1,4 +1,5 @@
 import { useMemo } from 'react';
+import { useReducedMotion } from '../lib/useReducedMotion';
 
 interface Props {
   accent: string;
@@ -17,14 +18,38 @@ function mulberry32(seed: number) {
 const BOLT_PATH = 'M 62 2 L 20 54 H 48 L 26 98 L 84 44 H 56 Z';
 
 export default function ThunderBackground({ accent }: Props) {
+  const reduced = useReducedMotion();
+
+  /**
+   * Seeded so the layout is stable across re-renders, but every star gets its own
+   * period, phase and peak brightness — a shared duration reads as a blinking
+   * machine, staggered ones read as a sky. The delay is applied negative so each
+   * star is already mid-cycle on the first frame instead of all starting dark
+   * together.
+   */
   const stars = useMemo(() => {
     const rng = mulberry32(77);
     return Array.from({ length: 45 }).map(() => ({
-      cx: rng() * 100,
-      cy: rng() * 100,
-      r: rng() * 1.0 + 0.25,
-      delay: rng() * 8,
-      dur: 2.5 + rng() * 5,
+      left: rng() * 100,
+      top: rng() * 100,
+      size: rng() * 2.0 + 0.9,
+      delay: rng() * 9,
+      dur: 2.6 + rng() * 5.4,
+      peak: 0.42 + rng() * 0.45,
+    }));
+  }, []);
+
+  /** Embers drift up from the bottom edge and fade out, then loop. */
+  const embers = useMemo(() => {
+    const rng = mulberry32(1337);
+    return Array.from({ length: 9 }).map(() => ({
+      left: 6 + rng() * 88,
+      size: 1.6 + rng() * 2.4,
+      dur: 9 + rng() * 9,
+      delay: rng() * 16,
+      drift: (rng() * 2 - 1) * 26,
+      rise: 150 + rng() * 130,
+      peak: 0.3 + rng() * 0.35,
     }));
   }, []);
 
@@ -84,25 +109,54 @@ export default function ThunderBackground({ accent }: Props) {
         <path d={BOLT_PATH} fill={accent} />
       </svg>
 
-      {/* ── Star particles ── */}
-      <svg
-        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
-        preserveAspectRatio="none"
-      >
+      {/* ── Star particles ──
+        * Plain elements rather than <circle>, so the pulse can drive transform as well
+        * as opacity — both compositor-friendly, no layout, no JS loop. Under
+        * prefers-reduced-motion the global rule in index.css drops the animation and
+        * each star falls back to its static base opacity. */}
+      <div style={{ position: 'absolute', inset: 0 }}>
         {stars.map((s, i) => (
-          <circle
+          <span
             key={i}
-            cx={`${s.cx}%`}
-            cy={`${s.cy}%`}
-            r={s.r}
-            fill="white"
+            className="star"
             style={{
-              opacity: 0.35,
-              animation: `twinkle ${s.dur}s ease-in-out ${s.delay}s infinite`,
-            }}
+              left: `${s.left}%`,
+              top: `${s.top}%`,
+              width: s.size,
+              height: s.size,
+              animationDuration: `${s.dur}s`,
+              animationDelay: `-${s.delay}s`,
+              ['--star-peak' as string]: s.peak,
+            } as React.CSSProperties}
           />
         ))}
-      </svg>
+      </div>
+
+      {/* ── Embers ──
+        * Not rendered at all under reduced motion: frozen mid-drift they would read as
+        * stray dots rather than as the static version of anything. */}
+      {!reduced && (
+        <div style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
+          {embers.map((e, i) => (
+            <span
+              key={i}
+              className="ember"
+              style={{
+                left: `${e.left}%`,
+                width: e.size,
+                height: e.size,
+                background: accent,
+                boxShadow: `0 0 6px ${accent}`,
+                animationDuration: `${e.dur}s`,
+                animationDelay: `-${e.delay}s`,
+                ['--ember-drift' as string]: `${e.drift}px`,
+                ['--ember-rise' as string]: `${e.rise}px`,
+                ['--ember-peak' as string]: e.peak,
+              } as React.CSSProperties}
+            />
+          ))}
+        </div>
+      )}
 
       {/* ── Edge vignette ── */}
       <div style={{

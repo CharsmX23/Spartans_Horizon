@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import {
-  Home, Settings, ChevronLeft, ChevronRight,
+  Home, ChevronLeft, ChevronRight,
   Zap, Target,
 } from 'lucide-react';
 
@@ -9,7 +9,7 @@ import {
 // Settings). Removing them from TabKey would delete the routes, not just the links.
 export type TabKey =
   | 'mission' | 'streaks' | 'powerup'
-  | 'goals' | 'squad' | 'settings' | 'tech';
+  | 'goals' | 'squad' | 'tech';
 
 interface NavItem {
   key: TabKey;
@@ -22,7 +22,6 @@ const NAV: NavItem[] = [
   { key: 'mission',  label: 'Mission Control', icon: Home },
   { key: 'powerup',  label: 'Power Up',         icon: Zap },
   { key: 'goals',    label: 'Goals',            icon: Target },
-  { key: 'settings', label: 'Settings',         icon: Settings },
 ];
 
 interface Props {

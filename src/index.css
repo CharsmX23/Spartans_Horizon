@@ -49,9 +49,45 @@ body {
   to   { transform: rotate(360deg); }
 }
 
+/* Star field behind the calendar. Duration, delay and peak brightness are set
+   per-star inline so no two pulse together. Only opacity/transform animate, so this
+   stays on the compositor. */
 @keyframes twinkle {
-  0%, 100% { opacity: 0.12; }
-  50%       { opacity: 0.70; }
+  0%, 100% { opacity: 0.10; transform: scale(0.8); }
+  50%      { opacity: var(--star-peak, 0.7); transform: scale(1.3); }
+}
+
+.star {
+  position: absolute;
+  border-radius: 50%;
+  background: #fff;
+  opacity: 0.32;              /* the static look, and the reduced-motion fallback */
+  will-change: opacity, transform;
+  animation-name: twinkle;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+}
+
+/* Ember particles: rise, drift sideways a little, fade out, loop. */
+@keyframes ember-rise {
+  0%   { transform: translate3d(0, 0, 0) scale(0.6); opacity: 0; }
+  15%  { opacity: var(--ember-peak, 0.5); }
+  70%  { opacity: calc(var(--ember-peak, 0.5) * 0.55); }
+  100% {
+    transform: translate3d(var(--ember-drift, 0px), calc(-1 * var(--ember-rise, 200px)), 0) scale(1.05);
+    opacity: 0;
+  }
+}
+
+.ember {
+  position: absolute;
+  bottom: -8px;
+  border-radius: 50%;
+  opacity: 0;
+  will-change: opacity, transform;
+  animation-name: ember-rise;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
 }
 
 @keyframes ring-fill {
@@ -62,8 +98,35 @@ body {
   animation: ring-fill 1.1s cubic-bezier(.2,.8,.2,1) forwards;
 }
 
+/* ── Cursor glow ────────────────────────────────────────────────────────────
+   Theme-coloured halo trailing the pointer. Positioned entirely through transform
+   (never top/left) so each frame is a composite, not a layout. The softness comes
+   from the gradient's stops rather than filter: blur(), which would repaint a large
+   surface every frame. Not rendered at all under prefers-reduced-motion. */
+.cursor-glow {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 240px;
+  height: 240px;
+  border-radius: 50%;
+  pointer-events: none;   /* never intercepts clicks, selection or form focus */
+  z-index: 9999;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+  mix-blend-mode: screen;
+  will-change: transform;
+  background: radial-gradient(
+    circle closest-side,
+    var(--accent-glow) 0%,
+    var(--accent-soft) 34%,
+    rgba(0, 0, 0, 0) 72%
+  );
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
+  .cursor-glow { display: none; }
 }
 
 /* ── Scrollbars ─────────────────────────────────────────────────────────── */

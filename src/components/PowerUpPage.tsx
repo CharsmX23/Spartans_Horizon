@@ -1,18 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Plus, X, Trash2, CheckCircle2, Circle, ChevronUp, ChevronDown,
+  Plus, X, Trash2, CheckCircle2, Circle, ChevronUp, ChevronDown, ChevronRight,
   BookMarked, Sparkles, Clock, Users, Lock, Camera, Loader2,
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/auth';
 import {
   LearningPath, LearningModule, LearningTask, ProofType, PROOF_TYPES,
-  loadPaths, createPath, updatePath, deletePath,
+  loadPaths, createPath, deletePath,
   createModule, updateModule, deleteModule,
   createTask, deleteTask,
   setTaskDone, reorder, pathProgress,
 } from '../lib/learning';
 import { verifyProof, validateProofFile } from '../lib/proof';
+import PathTimeline from './PathTimeline';
 
 /**
  * Power Up — manual CRUD over learning paths, modules, and tasks.
@@ -62,10 +63,11 @@ export default function PowerUpPage() {
   const [busy, setBusy] = useState(false);
 
   const [showNewPath, setShowNewPath] = useState(false);
+  // Which path has its timeline pulled open. One at a time, so the list stays scannable.
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   const [addingModuleTo, setAddingModuleTo] = useState<string | null>(null);
   const [editingModule, setEditingModule] = useState<string | null>(null);
   const [addingTaskTo, setAddingTaskTo] = useState<string | null>(null);
-  const [editingTerms, setEditingTerms] = useState(false);
 
   // Photo-proof verification. The pending task is held only long enough to attach the
   // picked file to it; the image itself never leaves this call chain.
@@ -226,6 +228,8 @@ export default function PowerUpPage() {
           onSubmit={async (values) => {
             const ok = await run(async () => {
               const { data, error: createError } = await createPath(values);
+              // Selected but not expanded: every path starts collapsed, including a
+              // brand new one. Opening the timeline is always a deliberate press.
               if (data) setSelectedId(data.id);
               return { error: createError };
             });
@@ -245,31 +249,19 @@ export default function PowerUpPage() {
       )}
 
       {paths.length > 0 && (
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          {paths.map((p) => {
-            const active = p.id === selectedId;
-            const mine = p.user_id === myId;
-            const { percent } = pathProgress(p);
-            return (
-              <button
-                key={p.id}
-                onClick={() => setSelectedId(p.id)}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
-                  borderRadius: 11, cursor: 'pointer', fontSize: 13,
-                  background: active ? 'var(--accent-soft)' : 'rgba(255,255,255,0.04)',
-                  border: `1px solid ${active ? 'var(--accent)' : 'rgba(255,255,255,0.10)'}`,
-                  color: active ? '#fff' : 'rgba(255,255,255,0.65)',
-                }}
-              >
-                {!mine && <Users className="w-3.5 h-3.5" style={{ opacity: 0.6 }} />}
-                <span style={{ fontWeight: active ? 600 : 500 }}>{p.title}</span>
-                <span style={{ fontSize: 11, opacity: 0.6 }}>
-                  {mine ? `${percent}%` : `@${owners[p.user_id] ?? '…'}`}
-                </span>
-              </button>
-            );
-          })}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {paths.map((p) => (
+            <PathRow
+              key={p.id}
+              path={p}
+              active={p.id === selectedId}
+              mine={p.user_id === myId}
+              ownerName={owners[p.user_id]}
+              expanded={expandedId === p.id}
+              onSelect={() => setSelectedId(p.id)}
+              onToggle={() => setExpandedId((current) => (current === p.id ? null : p.id))}
+            />
+          ))}
         </div>
       )}
 
@@ -287,12 +279,77 @@ export default function PowerUpPage() {
           setEditingModule={setEditingModule}
           addingTaskTo={addingTaskTo}
           setAddingTaskTo={setAddingTaskTo}
-          editingTerms={editingTerms}
-          setEditingTerms={setEditingTerms}
           onVerifyTask={startProof}
           verifyingTaskId={verifyingTaskId}
         />
       )}
+    </div>
+  );
+}
+
+/* ─────────────────────────── Path row ───────────────────────────
+ * One path in the picker. The body selects it (the modules below follow); the chevron
+ * pulls its timeline open in place, the same gesture as a mission card on the home
+ * screen. The timeline lives here rather than in PathDetail so it belongs to the path
+ * you pressed, not to whatever happens to be selected.
+ */
+
+function PathRow({ path, active, mine, ownerName, expanded, onSelect, onToggle }: {
+  path: LearningPath;
+  active: boolean;
+  mine: boolean;
+  ownerName?: string;
+  expanded: boolean;
+  onSelect: () => void;
+  onToggle: () => void;
+}) {
+  const { percent } = pathProgress(path);
+
+  return (
+    <div style={{
+      ...panel,
+      padding: 12,
+      background: active ? 'var(--accent-soft)' : 'rgba(255,255,255,0.04)',
+      border: `1px solid ${active ? 'var(--accent)' : 'rgba(255,255,255,0.10)'}`,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <button
+          onClick={onToggle}
+          title={expanded ? 'Hide timeline' : 'Show timeline'}
+          style={{
+            width: 28, height: 28, borderRadius: 9, display: 'grid', placeItems: 'center',
+            flexShrink: 0, cursor: 'pointer',
+            background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)',
+            color: 'rgba(255,255,255,0.7)',
+          }}
+        >
+          {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+        </button>
+
+        <button
+          onClick={onSelect}
+          style={{
+            flex: 1, minWidth: 0, textAlign: 'left', background: 'none', border: 'none',
+            padding: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8,
+          }}
+        >
+          {!mine && <Users className="w-3.5 h-3.5" style={{ color: 'rgba(255,255,255,0.5)', flexShrink: 0 }} />}
+          <span style={{
+            fontSize: 13, fontWeight: active ? 600 : 500,
+            color: active ? '#fff' : 'rgba(255,255,255,0.7)',
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
+            {path.title}
+          </span>
+          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', flexShrink: 0 }}>
+            {mine ? `${percent}%` : `@${ownerName ?? '…'}`}
+          </span>
+        </button>
+      </div>
+
+      {/* Mounted only while open, so a collapsed path costs nothing and shows nothing —
+          no query, no error banner, just the chevron. */}
+      {expanded && <PathTimeline path={path} isOwner={mine} />}
     </div>
   );
 }
@@ -311,8 +368,6 @@ interface DetailProps {
   setEditingModule: (v: string | null) => void;
   addingTaskTo: string | null;
   setAddingTaskTo: (v: string | null) => void;
-  editingTerms: boolean;
-  setEditingTerms: (v: boolean) => void;
   onVerifyTask: (task: LearningTask) => void;
   verifyingTaskId: string | null;
 }
@@ -321,7 +376,7 @@ function PathDetail(props: DetailProps) {
   const {
     path, isOwner, ownerName, busy, run,
     addingModuleTo, setAddingModuleTo, editingModule, setEditingModule,
-    addingTaskTo, setAddingTaskTo, editingTerms, setEditingTerms,
+    addingTaskTo, setAddingTaskTo,
     onVerifyTask, verifyingTaskId,
   } = props;
 
@@ -386,15 +441,6 @@ function PathDetail(props: DetailProps) {
         </div>
       </section>
 
-      <FoundationalTerms
-        path={path}
-        isOwner={isOwner}
-        busy={busy}
-        run={run}
-        editing={editingTerms}
-        setEditing={setEditingTerms}
-      />
-
       {path.modules.map((mod, index) => (
         <ModuleCard
           key={mod.id}
@@ -438,110 +484,6 @@ function PathDetail(props: DetailProps) {
         )
       )}
     </div>
-  );
-}
-
-/* ───────────────────── Foundational terms ("The Base") ───────────────────── */
-
-function FoundationalTerms({ path, isOwner, busy, run, editing, setEditing }: {
-  path: LearningPath;
-  isOwner: boolean;
-  busy: boolean;
-  run: Run;
-  editing: boolean;
-  setEditing: (v: boolean) => void;
-}) {
-  const [term, setTerm] = useState('');
-  const [definition, setDefinition] = useState('');
-
-  const terms = path.foundational_terms;
-
-  async function addTerm() {
-    if (!term.trim() || !definition.trim()) return;
-    const next = [...terms, { term: term.trim(), definition: definition.trim() }];
-    const ok = await run(() => updatePath(path.id, { foundational_terms: next }));
-    if (ok) { setTerm(''); setDefinition(''); }
-  }
-
-  async function removeTerm(index: number) {
-    const next = terms.filter((_, i) => i !== index);
-    await run(() => updatePath(path.id, { foundational_terms: next }));
-  }
-
-  if (terms.length === 0 && !isOwner) return null;
-
-  return (
-    <section style={{ ...panel, padding: 18 }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
-          <BookMarked className="w-4 h-4" style={{ color: 'var(--accent)' }} />
-          <span style={{ color: '#fff', fontSize: 13, fontWeight: 600 }}>The Base</span>
-          <span style={{ color: 'rgba(255,255,255,0.35)', fontSize: 11 }}>
-            must-know terms, defined up front
-          </span>
-        </div>
-        {isOwner && (
-          <button
-            onClick={() => setEditing(!editing)}
-            style={{ background: 'none', border: 'none', color: 'rgba(255,255,255,0.5)', fontSize: 11, cursor: 'pointer' }}
-          >
-            {editing ? 'Done' : 'Edit'}
-          </button>
-        )}
-      </div>
-
-      {terms.length === 0 && !editing && (
-        <p style={{ color: 'rgba(255,255,255,0.3)', fontSize: 12 }}>No foundational terms yet.</p>
-      )}
-
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {terms.map((t, i) => (
-          <div key={`${t.term}-${i}`} style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
-            <div style={{ flex: 1, fontSize: 12, lineHeight: 1.5 }}>
-              <span style={{ color: '#fff', fontWeight: 600 }}>{t.term}</span>
-              <span style={{ color: 'rgba(255,255,255,0.45)' }}> — {t.definition}</span>
-            </div>
-            {editing && (
-              <button
-                onClick={() => void removeTerm(i)}
-                disabled={busy}
-                style={{ background: 'none', border: 'none', color: '#fca5a5', cursor: 'pointer', padding: 0 }}
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            )}
-          </div>
-        ))}
-      </div>
-
-      {editing && (
-        <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
-          <input
-            value={term}
-            onChange={(e) => setTerm(e.target.value)}
-            placeholder="Term"
-            style={{ ...inputStyle, width: 160 }}
-          />
-          <input
-            value={definition}
-            onChange={(e) => setDefinition(e.target.value)}
-            placeholder="Definition"
-            onKeyDown={(e) => { if (e.key === 'Enter') void addTerm(); }}
-            style={{ ...inputStyle, flex: 1, minWidth: 200 }}
-          />
-          <button
-            onClick={() => void addTerm()}
-            disabled={busy || !term.trim() || !definition.trim()}
-            style={{
-              padding: '0 14px', borderRadius: 10, border: 'none', cursor: 'pointer',
-              background: 'var(--accent)', color: '#fff', fontSize: 12, fontWeight: 600,
-            }}
-          >
-            Add
-          </button>
-        </div>
-      )}
-    </section>
   );
 }
 

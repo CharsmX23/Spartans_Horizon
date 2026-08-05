@@ -6,6 +6,7 @@ import RightSidebar from './components/RightSidebar';
 import { NextMissions } from './components/LowerSections';
 import { GoalsSummary } from './components/GoalsSummary';
 import CursorGlow from './components/CursorGlow';
+import CursorReveal from './components/CursorReveal';
 import SettingsPanel from './components/SettingsPanel';
 import MobileTabBar from './components/MobileTabBar';
 import StreaksPage from './components/StreaksPage';
@@ -85,7 +86,13 @@ function AppShell() {
   }
 
   return (
-    <div className="h-screen flex flex-col bg-ink text-white/80 overflow-hidden">
+    // `isolate` makes this the stacking context CursorReveal's z-index:-1 layer sits
+    // in: above this div's background, below everything else in it.
+    <div className="h-screen flex flex-col bg-ink text-white/80 overflow-hidden isolate">
+      {/* The hidden icon field the cursor light uncovers — behind every tab, not just
+          the home screen, so the effect does not vanish when you navigate. */}
+      <CursorReveal accent={accent} />
+
       <TopBar user={user} onOpenSettings={() => setSettingsOpen(true)} />
 
       <div className="flex flex-1 min-h-0">

@@ -51,14 +51,49 @@ body {
 
 /* Star field behind the calendar. Duration, delay and peak brightness are set
    per-star inline so no two pulse together. Only opacity/transform animate, so this
-   stays on the compositor. */
+   stays on the compositor.
+
+   Each star is two nested elements on purpose: the wrapper drifts (transform) and the
+   star inside pulses (transform + opacity). One element cannot run both, because both
+   animations would be writing `transform` and the last one declared would win. */
 @keyframes twinkle {
   0%, 100% { opacity: 0.10; transform: scale(0.8); }
   50%      { opacity: var(--star-peak, 0.7); transform: scale(1.3); }
 }
 
+/* The sharper cousin: dark most of the cycle, then a short bright spike. A handful of
+   these among the steady twinklers is what stops the field looking like it is idling. */
+@keyframes star-flash {
+  0%, 82%, 100% { opacity: 0.05; transform: scale(0.55); }
+  88%           { opacity: var(--star-peak, 0.9); transform: scale(1.75); }
+  93%           { opacity: 0.14; transform: scale(0.9); }
+}
+
+/* Slow wander, so the constellation is never quite where it was. Amplitudes come in
+   per-star as --drift-x / --drift-y; the path is asymmetric so it does not read as a
+   pendulum swinging back and forth. */
+@keyframes star-drift {
+  0%   { transform: translate3d(0, 0, 0); }
+  25%  { transform: translate3d(var(--drift-x, 0px), calc(var(--drift-y, 0px) * -1), 0); }
+  50%  { transform: translate3d(calc(var(--drift-x, 0px) * -0.55), var(--drift-y, 0px), 0); }
+  75%  { transform: translate3d(calc(var(--drift-x, 0px) * -1), calc(var(--drift-y, 0px) * -0.45), 0); }
+  100% { transform: translate3d(0, 0, 0); }
+}
+
+.star-orbit {
+  position: absolute;
+  width: 0;
+  height: 0;
+  will-change: transform;
+  animation-name: star-drift;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+}
+
 .star {
   position: absolute;
+  top: 0;
+  left: 0;
   border-radius: 50%;
   background: #fff;
   opacity: 0.32;              /* the static look, and the reduced-motion fallback */
@@ -66,6 +101,11 @@ body {
   animation-name: twinkle;
   animation-timing-function: ease-in-out;
   animation-iteration-count: infinite;
+}
+
+.star.flash {
+  animation-name: star-flash;
+  animation-timing-function: ease-out;
 }
 
 /* Ember particles: rise, drift sideways a little, fade out, loop. */
@@ -99,10 +139,12 @@ body {
 }
 
 /* ── Cursor glow ────────────────────────────────────────────────────────────
-   Theme-coloured halo trailing the pointer. Positioned entirely through transform
-   (never top/left) so each frame is a composite, not a layout. The softness comes
-   from the gradient's stops rather than filter: blur(), which would repaint a large
-   surface every frame. Not rendered at all under prefers-reduced-motion. */
+   Theme-coloured halo locked to the pointer. Positioned entirely through transform
+   (never top/left) so each frame is a composite, not a layout, and transform is
+   deliberately left out of the transition below — the glow must land on the cursor in
+   the same frame, not ease toward it. The softness comes from the gradient's stops
+   rather than filter: blur(), which would repaint a large surface every frame. Not
+   rendered at all under prefers-reduced-motion. */
 .cursor-glow {
   position: fixed;
   top: 0;
@@ -124,9 +166,61 @@ body {
   );
 }
 
+/* ── Cursor reveal ──────────────────────────────────────────────────────────
+   The moving window that uncovers the icon field (see components/CursorReveal.tsx).
+   The mask is static and the box is translated, so nothing repaints as it moves —
+   only `transform` changes on this element and its child. `screen` blending makes the
+   accent-coloured glyphs read as light picked out of the dark, and z-index -1 keeps
+   them behind the page content inside the shell's isolated stacking context. */
+.cursor-reveal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: -1;
+  pointer-events: none;
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity 0.3s ease;   /* transform is excluded on purpose — it must not lag */
+  will-change: transform;
+  mix-blend-mode: screen;
+  -webkit-mask-image: radial-gradient(
+    circle closest-side,
+    #000 0%,
+    rgba(0, 0, 0, 0.9) 38%,
+    rgba(0, 0, 0, 0.45) 62%,
+    rgba(0, 0, 0, 0) 80%
+  );
+  mask-image: radial-gradient(
+    circle closest-side,
+    #000 0%,
+    rgba(0, 0, 0, 0.9) 38%,
+    rgba(0, 0, 0, 0.45) 62%,
+    rgba(0, 0, 0, 0) 80%
+  );
+}
+
+/* Counter-translated by the same amount as the window, which pins the icons to the
+   viewport. Sized in vw/vh so the field always spans the screen. */
+.cursor-reveal-field {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  will-change: transform;
+}
+
+.reveal-icon {
+  position: absolute;
+  display: block;
+  color: var(--accent);
+  filter: drop-shadow(0 0 6px var(--accent-glow));
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
-  .cursor-glow { display: none; }
+  .cursor-glow,
+  .cursor-reveal { display: none; }
 }
 
 /* ── Scrollbars ─────────────────────────────────────────────────────────── */

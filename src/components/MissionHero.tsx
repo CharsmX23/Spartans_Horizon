@@ -47,7 +47,7 @@ export default function MissionHero({ user }: Props) {
     <section className="glass" style={{ position: 'relative', padding: '22px 24px 26px' }}>
       {/* Thunder background, self-clipping */}
       <div style={{ position: 'absolute', inset: 0, overflow: 'hidden', borderRadius: 18, zIndex: 0 }}>
-        <ThunderBackground accent={accent.hex} />
+        <ThunderBackground accent={accent.hex} accentKey={user.accent} />
       </div>
 
       {/* Content: left column + right Today panel side-by-side */}

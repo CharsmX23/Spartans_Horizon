@@ -5,8 +5,9 @@ import {
   deadlineLabel, deadlineColor,
 } from '../lib/missions';
 import {
-  MissionPhase, PhaseStatus, loadPhases, createPhase, updatePhase, deletePhase, nextStatus,
+  MissionPhase, loadPhases, createPhase, updatePhase, deletePhase, nextStatus,
 } from '../lib/missionPhases';
+import { TimelineNode, TimelineConnector, nodeAlignedLine } from './TimelineNode';
 
 /* ── Next Missions ──────────────────────────────────────────────────────── */
 /**
@@ -186,12 +187,13 @@ function MissionCard({ mission, busy, onEdit, onDelete }: {
  * An expandable per-mission list of phases. Status is a single-click cycle
  * (pending -> live -> completed) that writes through updatePhase; user_id / mission_id
  * are never sent, so a phase cannot be reassigned or moved from here.
+ *
+ * The dot and the line between dots come from TimelineNode, shared with the learning
+ * path timeline in Power Up — the two read as one component because they are one.
  */
-const PHASE_COLORS: Record<PhaseStatus, string> = {
-  pending: 'rgba(255,255,255,0.25)',
-  live: 'var(--accent)',
-  completed: '#34D399',
-};
+
+/** Flex gap of the phase list. The connector reads it to reach the next dot's centre. */
+const PHASE_GAP = 8;
 
 function PhaseTimeline({ missionId }: { missionId: string }) {
   const [phases, setPhases] = useState<MissionPhase[] | null>(null);
@@ -246,13 +248,12 @@ function PhaseTimeline({ missionId }: { missionId: string }) {
       {phases === null && <div className="text-[11px] text-white/30 py-1">Loading phases…</div>}
 
       {phases && phases.length > 0 && (
-        <div className="relative flex flex-col gap-2 pl-1">
-          {/* the timeline rail */}
-          <span className="absolute left-[8px] top-1.5 bottom-1.5 w-px bg-white/10" />
-          {phases.map((p) => (
+        <div className="flex flex-col" style={{ gap: PHASE_GAP }}>
+          {phases.map((p, index) => (
             <PhaseRow
               key={p.id}
               phase={p}
+              isLast={index === phases.length - 1}
               busy={busy}
               onCycle={() => run(() => updatePhase(p.id, { status: nextStatus(p.status) }))}
               onDelete={() => run(() => deletePhase(p.id))}
@@ -284,35 +285,33 @@ function PhaseTimeline({ missionId }: { missionId: string }) {
   );
 }
 
-function PhaseRow({ phase, busy, onCycle, onDelete }: {
+function PhaseRow({ phase, isLast, busy, onCycle, onDelete }: {
   phase: MissionPhase;
+  isLast: boolean;
   busy: boolean;
   onCycle: () => void;
   onDelete: () => void;
 }) {
-  const dotColor = PHASE_COLORS[phase.status];
   const done = phase.status === 'completed';
   const targetLabel = phase.target_date
     ? new Date(`${phase.target_date}T00:00:00`).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
     : null;
 
   return (
-    <div className="relative flex items-center gap-2.5 group/phase">
-      <button
-        onClick={onCycle}
+    // Top-aligned, not centred: the connector's start is measured from the row's top
+    // edge, so the dot has to sit at a fixed offset there. `nodeAlignedLine` puts the
+    // text back on the dot's centre line.
+    <div className="relative flex items-start gap-2.5 group/phase">
+      {!isLast && <TimelineConnector gap={PHASE_GAP} />}
+
+      <TimelineNode
+        status={phase.status}
         disabled={busy}
         title={`Status: ${phase.status} — click to advance`}
-        className="relative z-10 w-[17px] h-[17px] rounded-full grid place-items-center shrink-0 transition"
-        style={{
-          background: phase.status === 'pending' ? 'rgba(20,20,26,1)' : dotColor,
-          border: `1.5px solid ${phase.status === 'pending' ? 'rgba(255,255,255,0.25)' : dotColor}`,
-          boxShadow: phase.status === 'live' ? `0 0 8px -1px ${dotColor}` : undefined,
-        }}
-      >
-        {done && <Check className="w-2.5 h-2.5 text-black/80" />}
-      </button>
+        onClick={onCycle}
+      />
 
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1" style={nodeAlignedLine}>
         <span
           className="text-[11px] leading-snug line-clamp-1"
           style={{ color: done ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.85)', textDecoration: done ? 'line-through' : 'none' }}
@@ -322,7 +321,7 @@ function PhaseRow({ phase, busy, onCycle, onDelete }: {
       </div>
 
       {targetLabel && (
-        <span className="text-[9px] text-white/35 shrink-0">{targetLabel}</span>
+        <span className="text-[9px] text-white/35 shrink-0" style={nodeAlignedLine}>{targetLabel}</span>
       )}
 
       <button

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Plus, X, Trash2, CheckCircle2, Circle, ChevronUp, ChevronDown, ChevronRight,
   BookMarked, Sparkles, Clock, Users, Lock, Camera, Loader2,
@@ -24,6 +24,15 @@ import PathTimeline from './PathTimeline';
  *
  * Squadmates' paths are visible but read-only. RLS and the column grants enforce that;
  * the UI only reflects it.
+ *
+ * ── One card per path ──────────────────────────────────────────────────────────
+ * A path has exactly one representation on this page: a collapsed row that expands in
+ * place, the same gesture and the same shape as a mission card on the home screen.
+ * There used to be two — a picker row up top *and* a detached detail panel below for
+ * whichever row was selected — which meant the path you were looking at appeared twice,
+ * in two different styles, with no visual link between them. There is no "selected"
+ * path any more, only an expanded one, and everything about a path lives inside its own
+ * card: overview, progress, modules, tasks, and the phase timeline.
  */
 
 const PROOF_COLORS: Record<ProofType, string> = {
@@ -57,13 +66,13 @@ export default function PowerUpPage() {
 
   const [paths, setPaths] = useState<LearningPath[]>([]);
   const [owners, setOwners] = useState<Record<string, string>>({});
-  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const [showNewPath, setShowNewPath] = useState(false);
-  // Which path has its timeline pulled open. One at a time, so the list stays scannable.
+  // Which path is open. One at a time, so the list stays scannable — and the only piece
+  // of per-path UI state there is, now that opening a path is the whole interaction.
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [addingModuleTo, setAddingModuleTo] = useState<string | null>(null);
   const [editingModule, setEditingModule] = useState<string | null>(null);
@@ -85,9 +94,9 @@ export default function PowerUpPage() {
     }
     const rows = data ?? [];
     setPaths(rows);
-    setSelectedId((current) =>
-      current && rows.some((p) => p.id === current) ? current : rows[0]?.id ?? null,
-    );
+    // A path that vanished (deleted here or by its owner) must not leave the page
+    // holding an id that no longer resolves.
+    setExpandedId((current) => (current && rows.some((p) => p.id === current) ? current : null));
 
     // Squadmates' usernames, for attribution on shared paths.
     const otherIds = [...new Set(rows.map((p) => p.user_id))].filter((id) => id !== myId);
@@ -110,12 +119,6 @@ export default function PowerUpPage() {
     setBusy(false);
     return !actionError;
   }, [load]);
-
-  const selected = useMemo(
-    () => paths.find((p) => p.id === selectedId) ?? null,
-    [paths, selectedId],
-  );
-  const isOwner = selected?.user_id === myId;
 
   /** Opens the picker for a task; the file lands in handleProofSelected below. */
   const startProof = useCallback((task: LearningTask) => {
@@ -226,13 +229,9 @@ export default function PowerUpPage() {
           busy={busy}
           onCancel={() => setShowNewPath(false)}
           onSubmit={async (values) => {
-            const ok = await run(async () => {
-              const { data, error: createError } = await createPath(values);
-              // Selected but not expanded: every path starts collapsed, including a
-              // brand new one. Opening the timeline is always a deliberate press.
-              if (data) setSelectedId(data.id);
-              return { error: createError };
-            });
+            // Every path starts collapsed, including a brand new one — opening a card is
+            // always a deliberate press, never something the page does on your behalf.
+            const ok = await run(() => createPath(values));
             if (ok) setShowNewPath(false);
           }}
         />
@@ -249,117 +248,50 @@ export default function PowerUpPage() {
       )}
 
       {paths.length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {paths.map((p) => (
-            <PathRow
+            <PathCard
               key={p.id}
               path={p}
-              active={p.id === selectedId}
-              mine={p.user_id === myId}
+              isOwner={p.user_id === myId}
               ownerName={owners[p.user_id]}
               expanded={expandedId === p.id}
-              onSelect={() => setSelectedId(p.id)}
               onToggle={() => setExpandedId((current) => (current === p.id ? null : p.id))}
+              busy={busy}
+              run={run}
+              addingModuleTo={addingModuleTo}
+              setAddingModuleTo={setAddingModuleTo}
+              editingModule={editingModule}
+              setEditingModule={setEditingModule}
+              addingTaskTo={addingTaskTo}
+              setAddingTaskTo={setAddingTaskTo}
+              onVerifyTask={startProof}
+              verifyingTaskId={verifyingTaskId}
             />
           ))}
         </div>
       )}
-
-      {selected && (
-        <PathDetail
-          key={selected.id}
-          path={selected}
-          isOwner={!!isOwner}
-          ownerName={owners[selected.user_id]}
-          busy={busy}
-          run={run}
-          addingModuleTo={addingModuleTo}
-          setAddingModuleTo={setAddingModuleTo}
-          editingModule={editingModule}
-          setEditingModule={setEditingModule}
-          addingTaskTo={addingTaskTo}
-          setAddingTaskTo={setAddingTaskTo}
-          onVerifyTask={startProof}
-          verifyingTaskId={verifyingTaskId}
-        />
-      )}
     </div>
   );
 }
 
-/* ─────────────────────────── Path row ───────────────────────────
- * One path in the picker. The body selects it (the modules below follow); the chevron
- * pulls its timeline open in place, the same gesture as a mission card on the home
- * screen. The timeline lives here rather than in PathDetail so it belongs to the path
- * you pressed, not to whatever happens to be selected.
+/* ─────────────────────────── Path card ───────────────────────────
+ * The only representation of a path on this page. Collapsed it is a single row — chevron,
+ * title, progress — and pressing anywhere on that row expands it in place to reveal
+ * everything: overview, counts, progress bar, modules and their tasks, and the phase
+ * timeline. Deliberately the same gesture and the same anatomy as a mission card on the
+ * home screen, so moving between the two teaches you nothing new.
+ *
+ * Nothing inside the expanded body is mounted while the card is shut, so a collapsed
+ * path costs no query and shows no error banner of its own — just the chevron.
  */
 
-function PathRow({ path, active, mine, ownerName, expanded, onSelect, onToggle }: {
-  path: LearningPath;
-  active: boolean;
-  mine: boolean;
-  ownerName?: string;
-  expanded: boolean;
-  onSelect: () => void;
-  onToggle: () => void;
-}) {
-  const { percent } = pathProgress(path);
-
-  return (
-    <div style={{
-      ...panel,
-      padding: 12,
-      background: active ? 'var(--accent-soft)' : 'rgba(255,255,255,0.04)',
-      border: `1px solid ${active ? 'var(--accent)' : 'rgba(255,255,255,0.10)'}`,
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <button
-          onClick={onToggle}
-          title={expanded ? 'Hide timeline' : 'Show timeline'}
-          style={{
-            width: 28, height: 28, borderRadius: 9, display: 'grid', placeItems: 'center',
-            flexShrink: 0, cursor: 'pointer',
-            background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)',
-            color: 'rgba(255,255,255,0.7)',
-          }}
-        >
-          {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-        </button>
-
-        <button
-          onClick={onSelect}
-          style={{
-            flex: 1, minWidth: 0, textAlign: 'left', background: 'none', border: 'none',
-            padding: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8,
-          }}
-        >
-          {!mine && <Users className="w-3.5 h-3.5" style={{ color: 'rgba(255,255,255,0.5)', flexShrink: 0 }} />}
-          <span style={{
-            fontSize: 13, fontWeight: active ? 600 : 500,
-            color: active ? '#fff' : 'rgba(255,255,255,0.7)',
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-          }}>
-            {path.title}
-          </span>
-          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', flexShrink: 0 }}>
-            {mine ? `${percent}%` : `@${ownerName ?? '…'}`}
-          </span>
-        </button>
-      </div>
-
-      {/* Mounted only while open, so a collapsed path costs nothing and shows nothing —
-          no query, no error banner, just the chevron. */}
-      {expanded && <PathTimeline path={path} isOwner={mine} />}
-    </div>
-  );
-}
-
-/* ─────────────────────────── Path detail ─────────────────────────── */
-
-interface DetailProps {
+interface PathCardProps {
   path: LearningPath;
   isOwner: boolean;
   ownerName?: string;
+  expanded: boolean;
+  onToggle: () => void;
   busy: boolean;
   run: Run;
   addingModuleTo: string | null;
@@ -372,38 +304,100 @@ interface DetailProps {
   verifyingTaskId: string | null;
 }
 
-function PathDetail(props: DetailProps) {
+function PathCard(props: PathCardProps) {
   const {
-    path, isOwner, ownerName, busy, run,
+    path, isOwner, ownerName, expanded, onToggle, busy, run,
     addingModuleTo, setAddingModuleTo, editingModule, setEditingModule,
-    addingTaskTo, setAddingTaskTo,
-    onVerifyTask, verifyingTaskId,
+    addingTaskTo, setAddingTaskTo, onVerifyTask, verifyingTaskId,
   } = props;
 
   const { done, total, percent } = pathProgress(path);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-      <section style={{ ...panel, padding: 20 }}>
-        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
-          <div style={{ minWidth: 0 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-              <h2 style={{ color: '#fff', fontSize: 18, fontWeight: 700, margin: 0 }}>{path.title}</h2>
-              {!isOwner && (
-                <span style={{
-                  display: 'flex', alignItems: 'center', gap: 4, fontSize: 10,
-                  color: 'rgba(255,255,255,0.5)', background: 'rgba(255,255,255,0.06)',
-                  border: '1px solid rgba(255,255,255,0.10)', borderRadius: 999, padding: '2px 8px',
-                }}>
-                  <Lock className="w-3 h-3" /> @{ownerName ?? 'squadmate'} · read-only
-                </span>
-              )}
-            </div>
+    <section style={{
+      ...panel,
+      padding: expanded ? 16 : 12,
+      background: expanded ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.04)',
+      border: `1px solid ${expanded ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.10)'}`,
+      transition: 'background .2s ease, border-color .2s ease',
+    }}>
+      {/* ── The collapsed row ── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <button
+          onClick={onToggle}
+          title={expanded ? 'Collapse path' : 'Expand path'}
+          style={{
+            width: 28, height: 28, borderRadius: 9, display: 'grid', placeItems: 'center',
+            flexShrink: 0, cursor: 'pointer',
+            background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)',
+            color: 'rgba(255,255,255,0.7)',
+          }}
+        >
+          {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+        </button>
+
+        {/* The whole row is the toggle, like a mission card — the chevron is the
+            affordance, not the only target. */}
+        <button
+          onClick={onToggle}
+          style={{
+            flex: 1, minWidth: 0, textAlign: 'left', background: 'none', border: 'none',
+            padding: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8,
+          }}
+        >
+          {!isOwner && <Users className="w-3.5 h-3.5" style={{ color: 'rgba(255,255,255,0.5)', flexShrink: 0 }} />}
+          <span style={{
+            fontSize: expanded ? 15 : 13, fontWeight: 600,
+            color: expanded ? '#fff' : 'rgba(255,255,255,0.8)',
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            transition: 'font-size .15s ease',
+          }}>
+            {path.title}
+          </span>
+          <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.4)', flexShrink: 0 }}>
+            {isOwner ? `${percent}%` : `@${ownerName ?? '…'}`}
+          </span>
+        </button>
+
+        {isOwner && (
+          <button
+            onClick={() => {
+              if (!confirm(`Delete "${path.title}" and all its modules and tasks?`)) return;
+              void run(() => deletePath(path.id));
+            }}
+            disabled={busy}
+            title="Delete path"
+            style={{
+              width: 28, height: 28, display: 'grid', placeItems: 'center', borderRadius: 9,
+              background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.25)',
+              color: '#fca5a5', cursor: 'pointer', flexShrink: 0,
+            }}
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </button>
+        )}
+      </div>
+
+      {/* ── Everything else, in place ── */}
+      {expanded && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginTop: 12 }}>
+          <div>
+            {!isOwner && (
+              <span style={{
+                display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 10,
+                color: 'rgba(255,255,255,0.5)', background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.10)', borderRadius: 999, padding: '2px 8px',
+              }}>
+                <Lock className="w-3 h-3" /> @{ownerName ?? 'squadmate'} · read-only
+              </span>
+            )}
+
             {path.overview && (
               <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: 13, marginTop: 6, maxWidth: 680 }}>
                 {path.overview}
               </p>
             )}
+
             <div style={{ display: 'flex', gap: 14, marginTop: 10, fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>
               {path.total_timeline_weeks && (
                 <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -413,77 +407,64 @@ function PathDetail(props: DetailProps) {
               <span>{path.modules.length} modules</span>
               <span>{done}/{total} tasks done</span>
             </div>
+
+            <div style={{
+              height: 6, borderRadius: 999, marginTop: 12,
+              background: 'rgba(255,255,255,0.07)', overflow: 'hidden',
+            }}>
+              <div style={{ width: `${percent}%`, height: '100%', background: 'var(--accent)', transition: 'width .3s' }} />
+            </div>
           </div>
+
+          {path.modules.map((mod, index) => (
+            <ModuleCard
+              key={mod.id}
+              module={mod}
+              path={path}
+              index={index}
+              isOwner={isOwner}
+              busy={busy}
+              run={run}
+              isEditing={editingModule === mod.id}
+              setEditing={(on) => setEditingModule(on ? mod.id : null)}
+              isAddingTask={addingTaskTo === mod.id}
+              setAddingTask={(on) => setAddingTaskTo(on ? mod.id : null)}
+              onVerifyTask={onVerifyTask}
+              verifyingTaskId={verifyingTaskId}
+            />
+          ))}
 
           {isOwner && (
-            <button
-              onClick={() => {
-                if (!confirm(`Delete "${path.title}" and all its modules and tasks?`)) return;
-                void run(() => deletePath(path.id));
-              }}
-              disabled={busy}
-              title="Delete path"
-              style={{
-                width: 30, height: 30, display: 'grid', placeItems: 'center', borderRadius: 9,
-                background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.25)',
-                color: '#fca5a5', cursor: 'pointer', flexShrink: 0,
-              }}
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-            </button>
+            addingModuleTo === path.id ? (
+              <ModuleForm
+                busy={busy}
+                onCancel={() => setAddingModuleTo(null)}
+                onSubmit={async (values) => {
+                  const ok = await run(() =>
+                    createModule({ ...values, path_id: path.id, sort_order: path.modules.length }));
+                  if (ok) setAddingModuleTo(null);
+                }}
+              />
+            ) : (
+              <button
+                onClick={() => setAddingModuleTo(path.id)}
+                style={{
+                  ...panel, padding: '10px 16px', display: 'flex', alignItems: 'center',
+                  justifyContent: 'center', gap: 6, color: 'rgba(255,255,255,0.5)',
+                  fontSize: 13, cursor: 'pointer', borderStyle: 'dashed',
+                }}
+              >
+                <Plus className="w-4 h-4" /> Add module
+              </button>
+            )
           )}
+
+          {/* Draws its own hairline separator and no chrome of its own — it reads as the
+              tail of this card, exactly as the phase list does on a mission card. */}
+          <PathTimeline path={path} isOwner={isOwner} />
         </div>
-
-        <div style={{ marginTop: 14 }}>
-          <div style={{ height: 6, borderRadius: 999, background: 'rgba(255,255,255,0.07)', overflow: 'hidden' }}>
-            <div style={{ width: `${percent}%`, height: '100%', background: 'var(--accent)', transition: 'width .3s' }} />
-          </div>
-        </div>
-      </section>
-
-      {path.modules.map((mod, index) => (
-        <ModuleCard
-          key={mod.id}
-          module={mod}
-          path={path}
-          index={index}
-          isOwner={isOwner}
-          busy={busy}
-          run={run}
-          isEditing={editingModule === mod.id}
-          setEditing={(on) => setEditingModule(on ? mod.id : null)}
-          isAddingTask={addingTaskTo === mod.id}
-          setAddingTask={(on) => setAddingTaskTo(on ? mod.id : null)}
-          onVerifyTask={onVerifyTask}
-          verifyingTaskId={verifyingTaskId}
-        />
-      ))}
-
-      {isOwner && (
-        addingModuleTo === path.id ? (
-          <ModuleForm
-            busy={busy}
-            onCancel={() => setAddingModuleTo(null)}
-            onSubmit={async (values) => {
-              const ok = await run(() =>
-                createModule({ ...values, path_id: path.id, sort_order: path.modules.length }));
-              if (ok) setAddingModuleTo(null);
-            }}
-          />
-        ) : (
-          <button
-            onClick={() => setAddingModuleTo(path.id)}
-            style={{
-              ...panel, padding: '12px 16px', display: 'flex', alignItems: 'center',
-              justifyContent: 'center', gap: 6, color: 'rgba(255,255,255,0.5)',
-              fontSize: 13, cursor: 'pointer', borderStyle: 'dashed',
-            }}
-          >
-            <Plus className="w-4 h-4" /> Add module
-          </button>
-        )
       )}
-    </div>
+    </section>
   );
 }
 

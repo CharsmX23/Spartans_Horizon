@@ -2,9 +2,10 @@ import { useCallback, useEffect, useState, FormEvent } from 'react';
 import { Plus, X, Check, Trash2, Pencil, ChevronDown, ChevronUp } from 'lucide-react';
 import { LearningPath } from '../lib/learning';
 import {
-  PathPhase, PhaseStatus, loadPathPhases, createPathPhase, updatePathPhase,
+  PathPhase, loadPathPhases, createPathPhase, updatePathPhase,
   deletePathPhase, movePhase, nextStatus, chainStartFrom,
 } from '../lib/pathPhases';
+import { TimelineNode, TimelineConnector, nodeAlignedLine } from './TimelineNode';
 
 /**
  * The phase timeline for a learning path — the same idea, and deliberately the same
@@ -30,13 +31,10 @@ import {
  * and the grants in the migration are what actually enforce it.
  */
 
-const PHASE_COLORS: Record<PhaseStatus, string> = {
-  pending: 'rgba(255,255,255,0.25)',
-  live: 'var(--accent)',
-  completed: '#34D399',
-};
-
 const WARN = '#FF4D2E';
+
+/** Flex gap of the phase list. The connector reads it to reach the next dot's centre. */
+const PHASE_GAP = 10;
 
 const field: React.CSSProperties = {
   background: 'rgba(255,255,255,0.05)',
@@ -128,13 +126,7 @@ export default function PathTimeline({ path, isOwner }: { path: LearningPath; is
       )}
 
       {list.length > 0 && (
-        <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', gap: 10, paddingLeft: 2 }}>
-          {/* The rail that makes the phases read as one chain rather than a list. */}
-          <span style={{
-            position: 'absolute', left: 10, top: 8, bottom: 8, width: 1,
-            background: 'rgba(255,255,255,0.10)',
-          }} />
-
+        <div style={{ display: 'flex', flexDirection: 'column', gap: PHASE_GAP }}>
           {list.map((phase, index) => (
             editingId === phase.id ? (
               <PhaseForm
@@ -233,31 +225,26 @@ function PhaseRow({ phase, index, isFirst, isLast, isOwner, busy, onCycle, onEdi
   onDelete: () => void;
 }) {
   const done = phase.status === 'completed';
-  const dotColor = PHASE_COLORS[phase.status];
   const range = formatRange(phase.start_date, phase.target_date);
   // Late is derived from the date, never stored — the same rule as a mission countdown.
   const late = !done && phase.target_date != null && new Date(`${phase.target_date}T23:59:59`) < new Date();
 
   return (
+    // Top-aligned so the connector's start is a constant offset from the row's top edge;
+    // `nodeAlignedLine` puts the title line back on the dot's centre.
     <div style={{ position: 'relative', display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-      <button
-        onClick={onCycle}
-        disabled={busy || !isOwner}
+      {!isLast && <TimelineConnector gap={PHASE_GAP} />}
+
+      <TimelineNode
+        status={phase.status}
+        disabled={busy}
+        interactive={isOwner}
         title={isOwner ? `Status: ${phase.status} — click to advance` : `Status: ${phase.status}`}
-        style={{
-          position: 'relative', zIndex: 1, width: 19, height: 19, borderRadius: '50%',
-          display: 'grid', placeItems: 'center', flexShrink: 0, marginTop: 1,
-          cursor: isOwner ? 'pointer' : 'default',
-          background: phase.status === 'pending' ? '#14141a' : dotColor,
-          border: `1.5px solid ${phase.status === 'pending' ? 'rgba(255,255,255,0.25)' : dotColor}`,
-          boxShadow: phase.status === 'live' ? `0 0 9px -1px ${dotColor}` : undefined,
-        }}
-      >
-        {done && <Check className="w-2.5 h-2.5" style={{ color: 'rgba(0,0,0,0.8)' }} />}
-      </button>
+        onClick={onCycle}
+      />
 
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <div style={{ ...nodeAlignedLine, gap: 8, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', fontWeight: 700 }}>
             {String(index + 1).padStart(2, '0')}
           </span>
@@ -332,7 +319,7 @@ function PhaseForm({ busy, initial, submitLabel, onCancel, onSubmit }: {
       onSubmit={submit}
       // No container of its own — the fields sit directly in the card, like the phase
       // form on a mission card.
-      style={{ display: 'flex', flexDirection: 'column', gap: 7, paddingLeft: 2 }}
+      style={{ display: 'flex', flexDirection: 'column', gap: 7 }}
     >
       <input
         value={title}

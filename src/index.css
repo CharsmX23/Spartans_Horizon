@@ -144,7 +144,18 @@ body {
    deliberately left out of the transition below — the glow must land on the cursor in
    the same frame, not ease toward it. The softness comes from the gradient's stops
    rather than filter: blur(), which would repaint a large surface every frame. Not
-   rendered at all under prefers-reduced-motion. */
+   rendered at all under prefers-reduced-motion.
+
+   ── It lights the room, it does not sit in front of you ──────────────────────
+   z-index is -1, not a value on top of the page. This element screen-blends, and a
+   screen blend painted *over* the UI lightens whatever it covers — at z-index 9999 it
+   dragged a red wash across card borders, body copy and progress bars, so a card under
+   the pointer read as tinted and broken. Behind the content it blends against the
+   shell's dark background instead, which is the only surface it was ever meant to
+   light. Same stacking context as .cursor-reveal (the `isolate` on AppShell's root):
+   above that div's background, below everything drawn inside it. Cards keep their own
+   contrast no matter where the pointer is; the glass ones pass a little of the light
+   through, which is the point. */
 .cursor-glow {
   position: fixed;
   top: 0;
@@ -153,7 +164,7 @@ body {
   height: 240px;
   border-radius: 50%;
   pointer-events: none;   /* never intercepts clicks, selection or form focus */
-  z-index: 9999;
+  z-index: -1;
   opacity: 0;
   transition: opacity 0.25s ease;
   mix-blend-mode: screen;

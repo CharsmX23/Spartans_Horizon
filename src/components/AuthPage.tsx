@@ -1,6 +1,7 @@
 import { useState, FormEvent } from 'react';
 import { AtSign, Lock, LogIn, UserPlus, Loader2, ShieldCheck } from 'lucide-react';
 import { useAuth } from '../lib/auth';
+import CursorGlow from './CursorGlow';
 
 type Mode = 'signin' | 'signup';
 
@@ -31,7 +32,11 @@ export default function AuthPage() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4 py-10 relative overflow-hidden bg-ink">
+    // `isolate` gives the cursor glow's z-index:-1 a stacking context to sit in — above
+    // this div's background, below the form.
+    <div className="min-h-screen flex items-center justify-center px-4 py-10 relative overflow-hidden bg-ink isolate">
+      <CursorGlow />
+
       {/* Ambient glow */}
       <div
         className="pointer-events-none absolute inset-0"

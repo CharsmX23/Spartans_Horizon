@@ -22,8 +22,6 @@ import { AuthProvider, useAuth } from './lib/auth';
 function App() {
   return (
     <AuthProvider>
-      {/* Fixed + pointer-events:none, so it sits outside every layout and gate. */}
-      <CursorGlow />
       <AppShell />
     </AuthProvider>
   );
@@ -86,9 +84,13 @@ function AppShell() {
   }
 
   return (
-    // `isolate` makes this the stacking context CursorReveal's z-index:-1 layer sits
-    // in: above this div's background, below everything else in it.
+    // `isolate` makes this the stacking context the two z-index:-1 cursor layers sit
+    // in: above this div's background, below everything else in it. Both are fixed and
+    // pointer-events:none, so they sit outside the layout entirely — but *behind* the
+    // content, which is what stops the glow washing over cards.
     <div className="h-screen flex flex-col bg-ink text-white/80 overflow-hidden isolate">
+      <CursorGlow />
+
       {/* The hidden icon field the cursor light uncovers — behind every tab, not just
           the home screen, so the effect does not vanish when you navigate. */}
       <CursorReveal accent={accent} />

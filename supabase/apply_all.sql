@@ -1453,3 +1453,547 @@ GRANT UPDATE (title, goal_type, deadline, status, description) ON goals TO authe
 
 NOTIFY pgrst, 'reload schema';
 
+
+-- ============================================================================
+-- 20260805120000_create_path_phases.sql
+-- ============================================================================
+
+/*
+# path_phases — expandable phase timeline per learning path
+
+Power Up's answer to `mission_phases`. A path's timeline used to be derived from module
+estimates, which meant it could only ever say "module 3 takes 5 days" — you could not
+name a stage. Phases are entered by hand ("Prototyping", "Evaluation") and chained in
+order, exactly like the phases under a mission on the home screen.
+
+## Objects created
+- TABLE path_phases
+- INDEX path_phases_path_order_idx, path_phases_user_id_idx
+
+## Ownership cannot drift
+`FOREIGN KEY (path_id, user_id) REFERENCES learning_paths(id, user_id)` — a phase whose
+owner differs from its path's owner is unrepresentable. `learning_paths` already carries
+the UNIQUE (id, user_id) this points at, so no prerequisite constraint is needed here.
+
+## Visibility follows the path, not the mission
+`mission_phases` is owner-only because missions are private. Learning paths are
+squad-readable (`shares_squad_with`), and a squadmate who can see the modules but not the
+phases would see a timeline with holes in it — so SELECT matches `learning_paths`.
+Writes stay owner-only.
+
+## Grants
+UPDATE is limited to the user-editable columns. `user_id` and `path_id` are excluded, so
+a phase can never be reassigned to another user or moved to another path from the client.
+*/
+
+CREATE TABLE IF NOT EXISTS path_phases (
+  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  path_id      uuid NOT NULL,
+  user_id      uuid NOT NULL DEFAULT auth.uid(),
+  title        text NOT NULL CHECK (char_length(trim(title)) BETWEEN 1 AND 120),
+  description  text,
+  status       text NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'live', 'completed')),
+  start_date   date,
+  target_date  date,
+  order_index  int NOT NULL DEFAULT 0,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (path_id, user_id) REFERENCES learning_paths(id, user_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS path_phases_path_order_idx ON path_phases(path_id, order_index);
+CREATE INDEX IF NOT EXISTS path_phases_user_id_idx ON path_phases(user_id);
+
+-- ── RLS ─────────────────────────────────────────────────────────────────
+ALTER TABLE path_phases ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "pp_select" ON path_phases;
+DROP POLICY IF EXISTS "pp_insert" ON path_phases;
+DROP POLICY IF EXISTS "pp_update" ON path_phases;
+DROP POLICY IF EXISTS "pp_delete" ON path_phases;
+
+CREATE POLICY "pp_select" ON path_phases FOR SELECT
+  TO authenticated USING (public.shares_squad_with(user_id));
+CREATE POLICY "pp_insert" ON path_phases FOR INSERT
+  TO authenticated WITH CHECK (user_id = auth.uid());
+CREATE POLICY "pp_update" ON path_phases FOR UPDATE
+  TO authenticated USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
+CREATE POLICY "pp_delete" ON path_phases FOR DELETE
+  TO authenticated USING (user_id = auth.uid());
+
+-- ── Grants: RLS picks rows, these pick columns ──────────────────────────
+REVOKE ALL ON path_phases FROM anon, authenticated;
+GRANT SELECT, INSERT, DELETE ON path_phases TO authenticated;
+GRANT UPDATE (title, description, status, start_date, target_date, order_index)
+  ON path_phases TO authenticated;
+
+NOTIFY pgrst, 'reload schema';
+
+
+-- ============================================================================
+-- 20260807120000_drop_learning_modules_tasks.sql
+-- ============================================================================
+
+/*
+# Drop learning_modules and learning_tasks
+
+Power Up's `paths -> modules -> tasks` hierarchy collapses to `paths -> phases`. A path
+now describes itself (title, overview, timeframe) and is broken into `path_phases`, the
+same timeline shape as a mission on the home screen. Modules and tasks were a second,
+parallel way of saying the same thing, in a different vocabulary, in a different visual
+language — so one of them had to go, and the phase timeline is the one that is already
+shared with missions.
+
+## What this drops
+- TABLE learning_tasks           (with its policies, indexes, and grants)
+- TABLE learning_modules         (ditto)
+- FUNCTION set_task_done(uuid, boolean)
+
+`set_task_done()` returns `learning_tasks` and writes to it; it cannot outlive the table
+and there is nothing left for it to tick. Its `GRANT EXECUTE ... TO authenticated` is
+dropped by Postgres along with the function — a grant cannot survive its object, so
+there is no separate REVOKE to remember here.
+
+## What this deliberately keeps
+- TABLE learning_paths, including `UNIQUE (id, user_id)`. That constraint was added as
+  the target of the composite FK from learning_modules, which is now gone — but
+  `path_phases` points at the *same* pair, so dropping it would break the ownership
+  guard on phases. It stays, and the DO block at the bottom fails the migration if it
+  ever silently doesn't.
+- TABLE path_phases — untouched by this migration; it is what replaces the dropped two.
+- FUNCTION shares_squad_with(uuid) — the SELECT policies on both learning_paths and
+  path_phases call it. Nothing about it is module-specific.
+
+## Ordering, and why there is no CASCADE
+`learning_tasks` is dropped before `learning_modules` so the FK between them resolves in
+the ordinary way. Neither drop uses CASCADE: if some object added later depends on these
+tables, this migration should fail loudly and be re-thought, not quietly take that object
+with it. The one known dependency, set_task_done(), is dropped explicitly above.
+
+## Before you run this
+`supabase/backup_before_module_drop.sql` dumps all three tables plus a flattened
+path/module/task export. Run and export it first — this migration is not reversible.
+*/
+
+-- ── The only object outside the tables that references them ─────────────────
+DROP FUNCTION IF EXISTS public.set_task_done(uuid, boolean);
+
+-- ── The tables, child first, no CASCADE ─────────────────────────────────────
+DROP TABLE IF EXISTS public.learning_tasks;
+DROP TABLE IF EXISTS public.learning_modules;
+
+-- ── Assert the keepers survived ─────────────────────────────────────────────
+-- A drop migration's real risk is not what it removes but what it removes *with* it.
+-- These four checks are the things path_phases and Power Up depend on; if any of them
+-- is missing when this block runs, the whole migration rolls back rather than leaving a
+-- half-dismantled schema behind.
+DO $$
+BEGIN
+  IF to_regclass('public.learning_paths') IS NULL THEN
+    RAISE EXCEPTION 'learning_paths is gone — it must survive this migration';
+  END IF;
+
+  IF to_regclass('public.path_phases') IS NULL THEN
+    RAISE EXCEPTION 'path_phases is gone — it is what replaces modules and tasks';
+  END IF;
+
+  -- The composite-FK target that path_phases(path_id, user_id) points at.
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    WHERE c.conrelid = 'public.learning_paths'::regclass
+      AND c.contype = 'u'
+      AND c.conkey @> ARRAY[
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'public.learning_paths'::regclass AND attname = 'id'),
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'public.learning_paths'::regclass AND attname = 'user_id')
+      ]::smallint[]
+  ) THEN
+    RAISE EXCEPTION 'learning_paths lost its UNIQUE (id, user_id) — path_phases FK is unbacked';
+  END IF;
+
+  IF to_regprocedure('public.shares_squad_with(uuid)') IS NULL THEN
+    RAISE EXCEPTION 'shares_squad_with(uuid) is gone — squad-read policies depend on it';
+  END IF;
+END;
+$$;
+
+-- PostgREST caches the schema; without this it keeps advertising the dropped tables and
+-- a stale client gets a confusing 404 instead of a clean "relation does not exist".
+NOTIFY pgrst, 'reload schema';
+
+
+-- ============================================================================
+-- 20260807130000_set_phase_verified.sql
+-- ============================================================================
+
+/*
+# set_phase_verified() — a phase reaches `completed` only through a passing photo
+
+## The problem this solves
+`path_phases.status` is one column with three values, and the client legitimately writes
+two of them: moving a phase to `live` or back to `pending` is ordinary editing. Only
+`completed` is a claim about reality that has to be earned.
+
+Column grants cannot express that. `GRANT UPDATE (status)` is all-or-nothing — it says
+*which column*, never *which value*. Revoking `status` outright would take `live` and
+`pending` with it and turn every status change into an RPC. So the grant stays exactly as
+`20260805120000_create_path_phases.sql` left it, and a BEFORE trigger narrows it per
+value: writes of `live`/`pending` pass straight through, and a transition into
+`completed` is rejected unless it arrives carrying a ticket that only
+`set_phase_verified()` can issue.
+
+## Objects created
+- FUNCTION path_phases_block_forged_completion()  — the trigger function
+- TRIGGER  path_phases_no_forged_completion       — BEFORE INSERT OR UPDATE, per row
+- FUNCTION set_phase_verified(p_phase_id uuid)    — SECURITY DEFINER; the only issuer
+
+## The ticket
+`set_phase_verified()` stamps the phase's id into the transaction-local GUC
+`app.verified_phase_id`, updates the row, then clears it. The trigger allows a
+transition into `completed` only when that GUC equals the id of the row being written.
+
+Three properties make the ticket worth anything, and losing any one of them silently
+reopens the hole:
+
+1. **It is transaction-local** (`set_config(..., is_local := true)`). PostgREST runs on a
+   pooled connection shared across users; a session-scoped GUC would outlive the request
+   and hand the next caller on that connection a free completion. `true` is load-bearing.
+2. **It carries an id, not a boolean.** A boolean ticket would authorise every row
+   touched while it was set — including a bulk `PATCH ...?id=in.(...)`. Scoping to one id
+   costs nothing and makes that unrepresentable.
+3. **The client cannot set it.** PostgREST exposes RPCs in the `public` schema and no raw
+   SQL; `set_config` lives in `pg_catalog` and is not reachable over HTTP. If a function
+   that forwards arbitrary `set_config` calls is ever added to `public`, this guard dies
+   with it.
+
+## Why a trigger and not "just trust SECURITY DEFINER"
+Triggers fire for every writer — RLS-bound clients, SECURITY DEFINER functions,
+`service_role`, and `postgres` in the SQL editor alike. That is the point: the guard does
+not care who you are, only whether the write is accompanied by a verification. It also
+means **hand-editing a phase to `completed` in the SQL editor is rejected too**. To do it
+deliberately, issue yourself a ticket in the same transaction:
+
+    BEGIN;
+      SELECT set_config('app.verified_phase_id', '<phase-uuid>', true);
+      UPDATE path_phases SET status = 'completed' WHERE id = '<phase-uuid>';
+    COMMIT;
+
+## INSERT is guarded as well as UPDATE
+An UPDATE-only trigger leaves `INSERT ... status = 'completed'` wide open — the client
+holds INSERT on `path_phases`, so a forged phase could simply be *born* completed. That
+is the same forbidden transition spelled differently, so the trigger covers both and a
+new phase always starts `pending` or `live`. If you ever want inserts unguarded, change
+the trigger to `BEFORE UPDATE` and delete the `TG_OP = 'INSERT'` branch below; nothing
+else changes.
+
+## Why this is `service_role`-only, and not `authenticated`
+An earlier draft took `(p_phase_id uuid)` and read the caller from `auth.uid()`, with
+EXECUTE granted to `authenticated` — the Edge Function forwarding the caller's JWT, the
+same shape as the old `set_task_done()`. That was tested and rejected: it closed the
+*PATCH* forge path but left the *RPC* one wide open. A signed-in user could open the
+console and call
+
+    await supabase.rpc('set_phase_verified', { p_phase_id: <their own phase> })
+
+and complete a phase with no photo — verified live, it returned 200 and `completed`. The
+trigger cannot help here, because this function is precisely the thing authorised to
+issue a ticket. Since phase progress is squad-readable, a faked `%` is not self-deception
+but a lie told to squadmates, which is the thing the whole verification flow exists to
+prevent.
+
+So it follows `record_checkin()` / `record_habit_completion()` instead: the caller id is
+a *parameter*, not `auth.uid()`, and only `service_role` may execute. The browser has no
+service-role key, so the only caller that can reach this is verify-proof, which supplies
+`p_user_id` from the JWT it has already verified — never from the request body, or a
+crafted payload would complete a phase as somebody else.
+
+The ownership check below is therefore still load-bearing: `service_role` bypasses RLS,
+so without it verify-proof could be talked into completing any phase in the database.
+*/
+
+-- ── The trigger function ────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION public.path_phases_block_forged_completion()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public
+AS $$
+DECLARE
+  v_ticket text;
+BEGIN
+  -- Not a write of `completed` at all — `live`, `pending`, and every non-status edit
+  -- pass through untouched. This is the common case and the reason the grant can stay
+  -- as wide as it is.
+  IF NEW.status IS DISTINCT FROM 'completed' THEN
+    RETURN NEW;
+  END IF;
+
+  -- Already completed, and staying completed: this UPDATE is editing something else on
+  -- an earned row (a title fix, a reorder). Guarding it would make a verified phase
+  -- permanently uneditable. Only the *transition into* completed is the claim.
+  -- OLD is NULL on INSERT, so TG_OP is checked before OLD is read.
+  IF TG_OP = 'UPDATE' AND OLD.status = 'completed' THEN
+    RETURN NEW;
+  END IF;
+
+  -- The ticket. `current_setting(name, missing_ok := true)` returns NULL when the GUC
+  -- was never set in this session — the one-argument form would raise instead.
+  v_ticket := current_setting('app.verified_phase_id', true);
+
+  -- IS DISTINCT FROM, never <>. `NULL <> '<uuid>'` evaluates to NULL, `IF NULL THEN`
+  -- does not run its body, and the guard would fall through to RETURN NEW — allowing
+  -- exactly the write it exists to reject, on every request that never set the GUC,
+  -- which is all of them. IS DISTINCT FROM treats NULL as a value and rejects.
+  IF v_ticket IS DISTINCT FROM NEW.id::text THEN
+    RAISE EXCEPTION
+      'A phase is completed by photo verification, not by writing status directly'
+      USING ERRCODE = 'insufficient_privilege',
+            HINT = 'Submit a photo through verify-proof; it calls set_phase_verified().';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+-- BEFORE, so a rejected write never reaches the row. FOR EACH ROW, so NEW.id exists and
+-- a multi-row PATCH is judged one row at a time rather than in bulk.
+DROP TRIGGER IF EXISTS path_phases_no_forged_completion ON public.path_phases;
+CREATE TRIGGER path_phases_no_forged_completion
+  BEFORE INSERT OR UPDATE ON public.path_phases
+  FOR EACH ROW
+  EXECUTE FUNCTION public.path_phases_block_forged_completion();
+
+-- ── set_phase_verified — the only issuer of a ticket ────────────────────────
+/*
+Called by the verify-proof Edge Function, with the admin client, after Gemini returns
+`progress` on a photo submitted against a phase. SECURITY DEFINER so it can issue the
+ticket regardless of the caller's grants — which also means it bypasses RLS, so ownership
+is checked here by hand.
+
+`p_user_id` is the caller, resolved by verify-proof from the verified JWT. It is a
+parameter and not `auth.uid()` because `service_role` has no `auth.uid()` — see the
+header for why that trade is the point rather than a compromise.
+
+Idempotent: completing an already-completed phase is a no-op that returns the row.
+*/
+DROP FUNCTION IF EXISTS public.set_phase_verified(uuid);
+
+CREATE OR REPLACE FUNCTION public.set_phase_verified(p_user_id uuid, p_phase_id uuid)
+RETURNS path_phases
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_phase path_phases;
+BEGIN
+  IF p_user_id IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated';
+  END IF;
+
+  -- SECURITY DEFINER bypasses RLS, so the row is fetched unfiltered and checked here.
+  SELECT * INTO v_phase FROM path_phases WHERE id = p_phase_id;
+
+  IF v_phase.id IS NULL THEN
+    RAISE EXCEPTION 'Phase not found';
+  END IF;
+
+  IF v_phase.user_id <> p_user_id THEN
+    RAISE EXCEPTION 'That phase belongs to someone else';
+  END IF;
+
+  -- Issue the ticket for this row only, for this transaction only.
+  PERFORM set_config('app.verified_phase_id', p_phase_id::text, true);
+
+  UPDATE path_phases
+     SET status = 'completed'
+   WHERE id = p_phase_id
+  RETURNING * INTO v_phase;
+
+  -- Spend it. `is_local := true` already means it dies at COMMIT, but clearing it here
+  -- makes the ticket single-use even inside one transaction, so a second UPDATE cannot
+  -- ride along behind the first.
+  PERFORM set_config('app.verified_phase_id', '', true);
+
+  RETURN v_phase;
+END;
+$$;
+
+-- REVOKE first, and from PUBLIC specifically. Postgres grants EXECUTE to PUBLIC on every
+-- newly created function, so granting to one role is never the whole story — the PUBLIC
+-- entry survives it, and `anon` (every unauthenticated visitor holding the publishable
+-- key) keeps EXECUTE. Naming `anon` and `authenticated` as well is belt-and-braces: they
+-- inherit through PUBLIC rather than holding their own entry, so the PUBLIC revoke is what
+-- actually does the work, but spelling them out means a future `GRANT ... TO authenticated`
+-- added by hand has to delete a line that says why it shouldn't exist.
+REVOKE ALL ON FUNCTION public.set_phase_verified(uuid, uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.set_phase_verified(uuid, uuid) TO service_role;
+
+NOTIFY pgrst, 'reload schema';
+
+
+-- ============================================================================
+-- 20260808120000_manual_phase_completion.sql
+-- ============================================================================
+
+/*
+# Power Up phases are completed by hand — the photo gate comes out
+
+## What changes and why
+`20260807130000_set_phase_verified.sql` made `completed` unreachable from the client: a
+BEFORE trigger rejected the transition for every writer, and the only thing that could
+issue the ticket past it was `set_phase_verified()`, called by the verify-proof Edge
+Function after Gemini accepted a photo.
+
+That is now the wrong model for paths. A path phase is a to-do item the owner marks off
+themselves — the status dot cycles pending -> live -> completed like the mission timeline
+already does, and the percentage on the card is self-reported by design. Nothing about
+that needs a photo, so the machinery enforcing one is removed rather than left inert.
+
+The AI on this page becomes an advisor instead of a gate: it reads the typed timeline and
+returns coaching text. It writes nothing and has no database path at all, so there is no
+function or grant here for it.
+
+## THIS DOES NOT TOUCH STREAKS OR HABITS
+`record_checkin()` and `record_habit_completion()` are untouched, as are `streak_logs`,
+`habit_completions`, `users.current_streak`, and every grant on them. Those stay
+photo-gated and service_role-only, because a streak IS a claim about reality and a faked
+one is a lie told to squadmates. Only the three path-specific objects below are dropped.
+The shared verify-proof Edge Function keeps its `streak` and `habit` branches; only the
+`phase_review` branch is removed from it.
+
+## Objects dropped
+- TRIGGER  path_phases_no_forged_completion   ON path_phases
+- FUNCTION path_phases_block_forged_completion()
+- FUNCTION set_phase_verified(uuid, uuid)
+
+## Grants do not change
+This is the part worth checking rather than assuming. `status` was ALREADY in the UPDATE
+grant from `20260805120000_create_path_phases.sql` — it had to be, because the client
+legitimately writes `live` and `pending`. The trigger, not the grant, was what narrowed
+the column to those two values. So dropping the trigger is the whole of the change: with
+it gone, `completed` is simply the third value of a column the owner could already write.
+
+The grant is re-asserted below anyway. It is idempotent and changes nothing; it is here so
+this file states the end state outright instead of leaving it two migrations back.
+
+`user_id` and `path_id` stay outside the grant, so a phase still cannot be reassigned to
+another user or moved to another path from the client, and the composite FK to
+`learning_paths(id, user_id)` still makes an owner mismatch unrepresentable. RLS is
+unchanged: squad-readable, owner-only writes.
+*/
+
+-- ── Drop the gate ───────────────────────────────────────────────────────────
+-- Trigger before function: the function cannot be dropped while the trigger depends on
+-- it, and DROP FUNCTION ... CASCADE would take the trigger silently rather than by name.
+DROP TRIGGER IF EXISTS path_phases_no_forged_completion ON public.path_phases;
+DROP FUNCTION IF EXISTS public.path_phases_block_forged_completion();
+
+-- Both signatures. The 1-arg version was an earlier draft that
+-- 20260807130000 already dropped; naming it here means a database that somehow still
+-- carries it (a partial apply, an older branch) ends up in the same state as one that
+-- does not.
+DROP FUNCTION IF EXISTS public.set_phase_verified(uuid);
+DROP FUNCTION IF EXISTS public.set_phase_verified(uuid, uuid);
+
+-- ── Re-assert the end state of the grant (no-op; see the header) ────────────
+GRANT UPDATE (title, description, status, start_date, target_date, order_index)
+  ON public.path_phases TO authenticated;
+
+NOTIFY pgrst, 'reload schema';
+
+
+/*
+════════════════════════════════════════════════════════════════════════════════
+VERIFY — run after applying. Nothing here writes.
+════════════════════════════════════════════════════════════════════════════════
+
+-- 1. The three dropped objects are gone.
+--    EXPECT: all three NULL / 0 rows.
+SELECT
+  to_regprocedure('public.set_phase_verified(uuid,uuid)')            AS set_phase_verified_2arg,
+  to_regprocedure('public.set_phase_verified(uuid)')                 AS set_phase_verified_1arg,
+  to_regprocedure('public.path_phases_block_forged_completion()')    AS trigger_function;
+
+SELECT t.tgname
+FROM pg_trigger t
+WHERE t.tgrelid = 'public.path_phases'::regclass AND NOT t.tgisinternal;
+-- EXPECT: 0 rows.
+
+
+-- 2. The grant is what the header claims.
+--    EXPECT: can_write_status = true   <- completion is now an ordinary client write
+--            can_write_user_id = false <- a phase cannot be handed to another user
+--            can_write_path_id = false <- a phase cannot be moved to another path
+SELECT
+  has_column_privilege('authenticated', 'public.path_phases', 'status',  'UPDATE') AS can_write_status,
+  has_column_privilege('authenticated', 'public.path_phases', 'title',   'UPDATE') AS can_write_title,
+  has_column_privilege('authenticated', 'public.path_phases', 'user_id', 'UPDATE') AS can_write_user_id,
+  has_column_privilege('authenticated', 'public.path_phases', 'path_id', 'UPDATE') AS can_write_path_id;
+
+-- Every UPDATE-able column and who holds it.
+-- EXPECT: authenticated -> description, order_index, start_date, status, target_date,
+--         title.  `anon` must not appear at all.
+SELECT grantee, column_name
+FROM information_schema.column_privileges
+WHERE table_schema = 'public' AND table_name = 'path_phases'
+  AND privilege_type = 'UPDATE' AND grantee IN ('anon', 'authenticated')
+ORDER BY grantee, column_name;
+
+
+-- 3. RLS still scopes writes to the owner — dropping the trigger must not have
+--    widened *whose* phases you can write, only which values you may write.
+--    EXPECT: 4 policies. pp_update USING and WITH CHECK both `user_id = auth.uid()`.
+SELECT policyname, cmd, qual, with_check
+FROM pg_policies
+WHERE schemaname = 'public' AND tablename = 'path_phases'
+ORDER BY policyname;
+
+
+-- 4. THE STREAK SIDE IS UNTOUCHED. This is the check that matters most in this file,
+--    because paths and streaks share one Edge Function and the risk was tearing out
+--    something the streak side still needs.
+--    EXPECT: both non-NULL, both security_definer = true.
+SELECT p.proname, p.prosecdef AS security_definer
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname IN ('record_checkin', 'record_habit_completion')
+ORDER BY p.proname;
+
+-- EXPECT: for BOTH functions — authenticated = false, anon = false, service_role = true.
+-- If any of these reads true for authenticated, a signed-in user can advance their own
+-- streak from the console with no photo, and this migration broke the thing it promised
+-- not to touch.
+SELECT
+  has_function_privilege('authenticated', 'public.record_checkin(uuid,text,date)', 'EXECUTE')               AS checkin_authenticated,
+  has_function_privilege('anon',          'public.record_checkin(uuid,text,date)', 'EXECUTE')               AS checkin_anon,
+  has_function_privilege('service_role',  'public.record_checkin(uuid,text,date)', 'EXECUTE')               AS checkin_service_role,
+  has_function_privilege('authenticated', 'public.record_habit_completion(uuid,uuid,text)', 'EXECUTE')      AS habit_authenticated,
+  has_function_privilege('anon',          'public.record_habit_completion(uuid,uuid,text)', 'EXECUTE')      AS habit_anon,
+  has_function_privilege('service_role',  'public.record_habit_completion(uuid,uuid,text)', 'EXECUTE')      AS habit_service_role;
+
+-- EXPECT: streak_logs and habit_completions grant the browser SELECT and nothing else —
+-- no INSERT, no UPDATE, no DELETE. Unchanged by this migration; verified because it is
+-- cheap and the consequence of being wrong is a fakeable streak.
+SELECT table_name, privilege_type, grantee
+FROM information_schema.table_privileges
+WHERE table_schema = 'public'
+  AND table_name IN ('streak_logs', 'habit_completions')
+  AND grantee IN ('anon', 'authenticated')
+ORDER BY table_name, grantee, privilege_type;
+
+
+-- 5. Completion now works from the client, and only for your own phases.
+--    Run as `postgres` in the SQL editor; substitute a real phase id.
+--    Before this migration the first UPDATE raised
+--    "A phase is completed by photo verification..." — now it should simply succeed.
+/*
+BEGIN;
+  UPDATE path_phases SET status = 'completed' WHERE id = '<phase-uuid>';
+  SELECT id, status FROM path_phases WHERE id = '<phase-uuid>';  -- completed
+ROLLBACK;
+*/
+*/
+

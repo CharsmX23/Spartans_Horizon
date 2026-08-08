@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
-import { Flame, Upload, CheckCircle, XCircle, Zap, Pencil, EyeOff, Check, SlidersHorizontal } from 'lucide-react';
+import { Flame, Upload, CheckCircle, XCircle, Zap, Pencil, EyeOff, Check, SlidersHorizontal, Camera } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { verifyProof, validateProofFile } from '../lib/proof';
 import { loadHabits, verifyHabit, habitIcon, updateHabit, setHabitActive, HabitToday } from '../lib/habits';
 import HabitManager from './HabitManager';
+import CameraCapture from './CameraCapture';
 import { useAuth } from '../lib/auth';
 import { ACCENTS } from '../theme';
 import { Person } from '../data';
@@ -19,6 +20,7 @@ interface Props { user: Person; }
 
 type UploadState =
   | 'idle'
+  | 'camera'     // live viewfinder; produces a File exactly like the picker does
   | 'preview'
   | 'submitting'
   | 'verified'   // reachable only on a genuine 'progress' verdict from Gemini
@@ -46,6 +48,9 @@ export default function StreaksPage({ user }: Props) {
   const [managing, setManaging] = useState(false);
   const [habitError, setHabitError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  // Separate input, because `capture` changes what the OS opens — one picker cannot be
+  // both "choose an existing photo" and "open the camera app".
+  const captureRef = useRef<HTMLInputElement>(null);
 
   // Authoritative value from users.current_streak, maintained by record_checkin().
   // Deliberately NOT recomputed from logs — two sources of truth would drift.
@@ -104,10 +109,12 @@ export default function StreaksPage({ user }: Props) {
     return true;
   }
 
-  function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
-    const selected = e.target.files?.[0];
-    if (!selected) return;
-
+  /**
+   * The one way a photo enters this page, whichever control produced it. A picked file
+   * and a camera still are both plain `File`s by the time they arrive here, so there is a
+   * single validation and a single preview rather than two that can drift apart.
+   */
+  function acceptFile(selected: File) {
     const invalid = validateProofFile(selected);
     if (invalid) {
       setMessage(invalid);
@@ -122,6 +129,30 @@ export default function StreaksPage({ user }: Props) {
     setPreviewUrl(URL.createObjectURL(selected));
     setMessage(null);
     setUploadState('preview');
+  }
+
+  function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    const selected = e.target.files?.[0];
+    // Reset first, so picking the same file twice still fires onChange.
+    e.target.value = '';
+    if (!selected) return;
+    acceptFile(selected);
+  }
+
+  /**
+   * Live viewfinder where the browser will give us one, the OS camera app where it will
+   * not. `navigator.mediaDevices` is undefined outside a secure context — which is exactly
+   * the case when this page is opened on a phone over the LAN by IP — and an
+   * `<input capture>` is not gated that way, so the fallback is the one that keeps a phone
+   * working on plain http.
+   */
+  function startCamera() {
+    setMessage(null);
+    if (typeof navigator.mediaDevices?.getUserMedia === 'function') {
+      setUploadState('camera');
+    } else {
+      captureRef.current?.click();
+    }
   }
 
   async function handleVerify() {
@@ -160,6 +191,7 @@ export default function StreaksPage({ user }: Props) {
     setFile(null);
     setMessage(null);
     if (fileRef.current) fileRef.current.value = '';
+    if (captureRef.current) captureRef.current.value = '';
   }
 
   // Build last-30-days grid
@@ -294,15 +326,46 @@ export default function StreaksPage({ user }: Props) {
         ) : (
           <>
             {uploadState === 'idle' && (
-              <button
-                onClick={() => fileRef.current?.click()}
-                className="flex flex-col items-center gap-3 w-full rounded-xl border-2 border-dashed py-10 transition hover:border-white/25"
-                style={{ borderColor: 'rgba(255,255,255,0.12)', background: 'rgba(255,255,255,0.02)' }}
-              >
-                <Upload className="w-8 h-8 text-white/40" />
-                <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: 14 }}>Drop a photo or click to upload</span>
-                <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>JPG, PNG, WEBP · max 5 MB</span>
-              </button>
+              <div className="w-full flex flex-col items-center gap-3">
+                <button
+                  onClick={() => fileRef.current?.click()}
+                  className="flex flex-col items-center gap-3 w-full rounded-xl border-2 border-dashed py-10 transition hover:border-white/25"
+                  style={{ borderColor: 'rgba(255,255,255,0.12)', background: 'rgba(255,255,255,0.02)' }}
+                >
+                  <Upload className="w-8 h-8 text-white/40" />
+                  <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: 14 }}>Drop a photo or click to upload</span>
+                  <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>JPG, PNG, WEBP · max 5 MB</span>
+                </button>
+
+                {/* The second way in. Same destination — validated, previewed, and sent to
+                    the same verifier — so nothing downstream knows which button was used. */}
+                <div className="flex items-center gap-3 w-full">
+                  <span style={{ flex: 1, height: 1, background: 'rgba(255,255,255,0.08)' }} />
+                  <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>or</span>
+                  <span style={{ flex: 1, height: 1, background: 'rgba(255,255,255,0.08)' }} />
+                </div>
+
+                <button
+                  onClick={startCamera}
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-semibold transition hover:brightness-110"
+                  style={{
+                    background: 'rgba(255,255,255,0.06)',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    color: 'rgba(255,255,255,0.85)',
+                  }}
+                >
+                  <Camera className="w-4 h-4" /> Take a photo with your camera
+                </button>
+              </div>
+            )}
+
+            {uploadState === 'camera' && (
+              <CameraCapture
+                accent={accent.hex}
+                onCapture={acceptFile}
+                onCancel={resetUpload}
+                onUseUpload={() => { setUploadState('idle'); fileRef.current?.click(); }}
+              />
             )}
 
             {uploadState === 'preview' && previewUrl && (
@@ -387,6 +450,10 @@ export default function StreaksPage({ user }: Props) {
             )}
 
             <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={handleFileSelect} />
+            {/* `capture="user"` asks the OS for the front camera directly. Desktop browsers
+                ignore the attribute and show an ordinary picker, which is why the live
+                stream above is tried first and this is only the fallback. */}
+            <input ref={captureRef} type="file" accept="image/*" capture="user" className="hidden" onChange={handleFileSelect} />
           </>
         )}
       </div>

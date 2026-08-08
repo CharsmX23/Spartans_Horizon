@@ -1,6 +1,5 @@
 /**
- * verify-proof — Gemini vision evaluation for streak proofs, learning-task proofs, and
- * daily-habit proofs.
+ * verify-proof — Gemini for streak proofs, daily-habit proofs, and learning-path advice.
  *
  * PRIVACY CONTRACT (the reason this function exists at all):
  * The image arrives as base64 in the request body, is held in a local variable for the
@@ -12,9 +11,34 @@
  * Do not add logging of `image_base64`. Do not add a "temporary" bucket write. The
  * error paths below deliberately log only status codes and messages, never the payload.
  *
- * AUTH: `verify_jwt` stays ON (the default). The caller's JWT is forwarded to PostgREST
- * so `set_task_done()` sees the real `auth.uid()` and its ownership check still applies
- * — this function cannot tick a task on behalf of someone else.
+ * ── Two shapes of request, and only one of them writes ─────────────────────────
+ *   'streak' / 'habit'  — a photo is judged. On `progress`, and only then, a
+ *                         service_role RPC records the check-in or the habit completion.
+ *                         These are claims about reality, so they stay photo-gated.
+ *   'path_advice'       — no image at all. The typed timeline of a learning path goes in,
+ *                         coaching text comes out. It writes NOTHING: there is no RPC
+ *                         call on this branch and no code path from it to the database.
+ *
+ * ── What used to be here: `phase_review` ───────────────────────────────────────
+ * A photo submitted against a learning-path phase was judged like any other proof, and on
+ * a pass the function called `set_phase_verified()` to mark the phase completed — the only
+ * route by which a phase could reach `completed`, with a trigger on `path_phases`
+ * rejecting every other writer.
+ *
+ * Path phases are now completed by hand: the owner clicks the status dot, like the mission
+ * timeline. So the branch, the RPC call, and `phase_confirmed` in the response are gone,
+ * along with the trigger and the function itself
+ * (`20260808120000_manual_phase_completion.sql`). The AI on that page advises instead of
+ * gating, which is the `path_advice` branch below.
+ *
+ * The streak and habit branches were deliberately left byte-for-byte as they were.
+ *
+ * AUTH: `verify_jwt` stays ON (the default). Every write below goes through a
+ * `service_role`-only RPC that takes the acting user as a parameter, and that parameter
+ * is always read from the verified JWT (`asUser.auth.getUser()`) and never from the
+ * request body — so a crafted payload cannot tick a habit or check in on behalf of
+ * someone else. The RPCs re-check ownership themselves, because `service_role` bypasses
+ * RLS.
  *
  * Deploy:  npx supabase functions deploy verify-proof --project-ref <ref>
  * Secret:  npx supabase secrets set GEMINI_API_KEY=... --project-ref <ref>
@@ -33,17 +57,47 @@ const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
+/** Bounds on the advice payload, so a crafted body cannot build an unbounded prompt. */
+const MAX_ADVICE_PHASES = 60;
+const MAX_FIELD_CHARS = 400;
+
+/** The kinds that judge a photo. `path_advice` is not one of them — it has no verdict. */
+type ProofKind = 'streak' | 'habit';
+type RequestKind = ProofKind | 'path_advice';
+
+interface AdvicePhase {
+  title: string;
+  description?: string | null;
+  status?: 'pending' | 'live' | 'completed';
+  start_date?: string | null;
+  target_date?: string | null;
+}
+
 interface VerifyRequest {
-  /** Raw base64, no data: prefix. */
-  image_base64: string;
-  mime_type: string;
-  /** The goal, task, or habit label the image is judged against. */
-  context: string;
-  kind: 'streak' | 'task' | 'habit';
-  /** Required when kind === 'task' — the task to tick on a pass. */
-  task_id?: string;
+  /** Raw base64, no data: prefix. Required for 'streak' and 'habit'. */
+  image_base64?: string;
+  mime_type?: string;
+  /** The goal or habit the photo is judged against. Not used by 'path_advice'. */
+  context?: string;
+  kind: RequestKind;
   /** Required when kind === 'habit' — the habit to record a completion for on a pass. */
   habit_id?: string;
+
+  // ── kind === 'path_advice' only ──
+  path?: {
+    title: string;
+    overview?: string | null;
+    total_timeline_weeks?: number | null;
+  };
+  phases?: AdvicePhase[];
+  /**
+   * The caller's local date as YYYY-MM-DD, for "am I on track". Deliberately the client's
+   * date rather than the server's: "behind schedule" is a statement about the user's
+   * calendar, and this branch writes nothing, so a wrong date costs a wrong sentence of
+   * advice and nothing else. Never use a client-supplied date on a branch that writes.
+   */
+  today?: string;
+
   /**
    * Diagnostics, no image involved:
    *  - 'list_models' — what the catalogue advertises for this key
@@ -65,8 +119,25 @@ interface StreakState {
   already_checked_in: boolean;
 }
 
+/** Coaching on a whole path. Four fields because four questions were asked of it. */
+interface PathAdvice {
+  /** Are these the right topics for the stated goal? */
+  coverage: string;
+  /** How is progress, given what is completed vs still open? */
+  progress: string;
+  /** On track against the dates and today? */
+  timing: string;
+  on_track: 'ahead' | 'on_track' | 'behind' | 'unknown';
+  /** What to focus on next. */
+  next: string;
+}
+
 type VerifyResponse =
-  | ({ status: 'ok'; task_confirmed: boolean; habit_confirmed: boolean; streak: StreakState | null } & Verdict)
+  | ({ status: 'ok'; habit_confirmed: boolean; streak: StreakState | null } & Verdict)
+  // Deliberately its own status rather than an `ok` with a null verdict: advice has no
+  // verdict to accidentally read as a pass, and a client that has not been taught about
+  // this branch falls into its error handling instead of its success handling.
+  | { status: 'advice'; advice: PathAdvice }
   | { status: 'not_configured'; message: string }
   | { status: 'models'; configured_model: string; available: string[] }
   | { status: 'model_test'; model: string; callable: boolean; detail: string }
@@ -89,10 +160,8 @@ function json(body: VerifyResponse, status: number): Response {
  * Asks one specific question rather than "describe this image" — a vague prompt makes
  * the model agreeable, and an agreeable judge is the same as no judge.
  */
-function buildPrompt(context: string, kind: 'streak' | 'task' | 'habit'): string {
-  const subject = kind === 'task'
-    ? `completion of this task: "${context}"`
-    : kind === 'habit'
+function buildPrompt(context: string, kind: ProofKind): string {
+  const subject = kind === 'habit'
     ? `completion of this daily habit: "${context}"`
     : `genuine progress toward this goal: "${context}"`;
 
@@ -116,13 +185,149 @@ function buildPrompt(context: string, kind: 'streak' | 'task' | 'habit'): string
   ].join('\n');
 }
 
+function clip(value: unknown, limit = MAX_FIELD_CHARS): string {
+  return typeof value === 'string' ? value.slice(0, limit) : '';
+}
+
+/** The timeline as the model sees it: one line per phase, in order, statuses included. */
+function renderTimeline(phases: AdvicePhase[]): string {
+  return phases.map((phase, index) => {
+    const status = phase.status ?? 'pending';
+    const dates = phase.start_date && phase.target_date
+      ? ` (${phase.start_date} → ${phase.target_date})`
+      : phase.target_date
+      ? ` (due ${phase.target_date})`
+      : phase.start_date
+      ? ` (from ${phase.start_date})`
+      : ' (no dates set)';
+    const description = clip(phase.description) ? ` — ${clip(phase.description)}` : '';
+    return `${index + 1}. [${status}] ${clip(phase.title, 160)}${description}${dates}`;
+  }).join('\n');
+}
+
+/**
+ * Path advice: no image, no verdict, no write.
+ *
+ * Replaces the per-phase coach review that used to hang off `phase_review`, and answers a
+ * bigger question than that one could — a single phase in isolation cannot say whether the
+ * plan covers the goal or whether the dates are slipping. The whole typed timeline goes in
+ * at once.
+ *
+ * The prompt is written so a refusal is impossible to mistake for a completion: it is
+ * asked for advice, it returns advice, and the caller has nowhere to put it but the screen.
+ */
+async function advise(
+  apiKey: string,
+  path: { title: string; overview?: string | null; total_timeline_weeks?: number | null },
+  phases: AdvicePhase[],
+  today: string,
+): Promise<PathAdvice> {
+  const done = phases.filter((p) => (p.status ?? 'pending') === 'completed').length;
+
+  const prompt = [
+    'You are coaching someone on a self-directed learning path. Below is the plan exactly',
+    'as they typed it, with the status of each phase and today\'s date.',
+    '',
+    `GOAL: ${clip(path.title, 200)}`,
+    path.overview ? `WHAT THEY WANT TO BE ABLE TO DO: ${clip(path.overview)}` : '',
+    path.total_timeline_weeks ? `PLANNED LENGTH: ${path.total_timeline_weeks} weeks` : '',
+    `TODAY: ${today}`,
+    `PROGRESS: ${done} of ${phases.length} phases marked completed`,
+    '',
+    'PHASES, in order:',
+    renderTimeline(phases),
+    '',
+    'Answer four things, each in two or three sentences, addressed directly to them:',
+    '',
+    'coverage — are these the right topics to actually reach that goal? Name anything',
+    '  important that is missing, and anything here that is not worth the time. Be specific',
+    '  about this subject matter; generic study advice is useless.',
+    '',
+    'progress — how are they doing, judging by what is completed against what is left?',
+    '',
+    'timing — are they on track? Reason from the phase dates against today. Say plainly if',
+    '  they are behind, and by roughly how much. If there are no dates, say that instead of',
+    '  guessing.',
+    '',
+    'next — the single thing to focus on next, and why that one.',
+    '',
+    'Also return on_track as exactly one of: ahead, on_track, behind, unknown.',
+    'Use unknown when there are not enough dates to judge.',
+    '',
+    'Be honest rather than encouraging. If the plan is thin or the pace has slipped, say',
+    'so. Do not invent detail that is not in the plan above.',
+  ].filter(Boolean).join('\n');
+
+  const response = await fetch(`${GEMINI_API_BASE}/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.6,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'OBJECT',
+          properties: {
+            coverage: { type: 'STRING' },
+            progress: { type: 'STRING' },
+            timing: { type: 'STRING' },
+            on_track: { type: 'STRING', enum: ['ahead', 'on_track', 'behind', 'unknown'] },
+            next: { type: 'STRING' },
+          },
+          required: ['coverage', 'progress', 'timing', 'on_track', 'next'],
+        },
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = (await response.text().catch(() => '')).slice(0, 300);
+    throw new Error(
+      `Gemini returned ${response.status} for model "${GEMINI_MODEL}"`
+      + (detail ? `: ${detail}` : ''),
+    );
+  }
+
+  const payload = await response.json();
+  const text = payload?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (typeof text !== 'string') throw new Error('Gemini returned no content');
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error('Gemini returned malformed JSON');
+  }
+
+  const candidate = parsed as Partial<PathAdvice>;
+  for (const field of ['coverage', 'progress', 'timing', 'next'] as const) {
+    if (typeof candidate[field] !== 'string' || candidate[field]!.trim() === '') {
+      throw new Error(`Gemini returned an empty ${field}`);
+    }
+  }
+  const onTrack = candidate.on_track;
+  return {
+    coverage: candidate.coverage!.trim(),
+    progress: candidate.progress!.trim(),
+    timing: candidate.timing!.trim(),
+    // Unrecognised falls back to `unknown` rather than throwing: the three paragraphs are
+    // the substance and a bad enum should not throw them away. This is advice, so
+    // degrading is correct here — a verdict would have to fail closed instead.
+    on_track: onTrack === 'ahead' || onTrack === 'on_track' || onTrack === 'behind'
+      ? onTrack
+      : 'unknown',
+    next: candidate.next!.trim(),
+  };
+}
+
 /** Calls Gemini with a response schema so the output shape is constrained, not hoped for. */
 async function evaluate(
   apiKey: string,
   imageBase64: string,
   mimeType: string,
   context: string,
-  kind: 'streak' | 'task' | 'habit',
+  kind: ProofKind,
 ): Promise<Verdict> {
   const response = await fetch(`${GEMINI_API_BASE}/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
     method: 'POST',
@@ -245,10 +450,47 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }, 200);
   }
 
-  if (!payload.image_base64 || !payload.mime_type || !payload.context) {
+  // ── Path advice: text in, text out, nothing written ────────────────────────
+  // Returns before any of the verification machinery below is reached. There is no RPC
+  // call on this branch and nothing for one to fall through into — advice must never be
+  // able to complete work.
+  if (payload.kind === 'path_advice') {
+    const path = payload.path;
+    const phases = payload.phases;
+    if (!path?.title || !Array.isArray(phases)) {
+      return json({ status: 'error', message: 'path and phases are required' }, 400);
+    }
+    if (phases.length === 0) {
+      return json({ status: 'error', message: 'Add a phase before asking for advice.' }, 400);
+    }
+    if (phases.length > MAX_ADVICE_PHASES) {
+      return json({ status: 'error', message: `At most ${MAX_ADVICE_PHASES} phases.` }, 413);
+    }
+
+    // A malformed date would end up in the prompt verbatim; keep it to the one shape the
+    // prompt claims it is, and fall back to the server's date rather than rejecting.
+    const today = /^\d{4}-\d{2}-\d{2}$/.test(payload.today ?? '')
+      ? payload.today!
+      : new Date().toISOString().slice(0, 10);
+
+    try {
+      const advice = await advise(apiKey, path, phases, today);
+      return json({ status: 'advice', advice }, 200);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'Path advice failed';
+      console.error('verify-proof path advice failed:', message);
+      return json({ status: 'error', message }, 502);
+    }
+  }
+
+  if (!payload.context) {
+    return json({ status: 'error', message: 'context is required' }, 400);
+  }
+
+  if (!payload.image_base64 || !payload.mime_type) {
     return json({
       status: 'error',
-      message: 'image_base64, mime_type and context are required',
+      message: 'image_base64 and mime_type are required',
     }, 400);
   }
 
@@ -264,7 +506,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
       payload.image_base64,
       payload.mime_type,
       payload.context,
-      payload.kind === 'task' ? 'task' : payload.kind === 'habit' ? 'habit' : 'streak',
+      payload.kind === 'habit' ? 'habit' : 'streak',
     );
   } catch (e) {
     const message = e instanceof Error ? e.message : 'Verification failed';
@@ -274,7 +516,6 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
   // The image has served its purpose; nothing below this line touches it.
 
-  let taskConfirmed = false;
   let habitConfirmed = false;
   let streak: StreakState | null = null;
 
@@ -286,26 +527,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
 
-    // Anon key + the caller's JWT. Used both to resolve who is calling and to run
-    // set_task_done() as them, so its ownership check still applies.
+    // Anon key + the caller's JWT. Used only to resolve *who is calling*; every write
+    // below runs through the admin client, because the RPCs are service_role-only.
     const asUser = createClient(supabaseUrl, Deno.env.get('SUPABASE_ANON_KEY')!, {
       global: { headers: { Authorization: authHeader } },
     });
-
-    if (payload.kind === 'task' && payload.task_id) {
-      const { error } = await asUser.rpc('set_task_done', {
-        p_task_id: payload.task_id,
-        p_done: true,
-      });
-      if (error) {
-        console.error('set_task_done failed:', error.message);
-        return json({
-          status: 'error',
-          message: `Verified, but could not tick the task: ${error.message}`,
-        }, 500);
-      }
-      taskConfirmed = true;
-    }
 
     if (payload.kind === 'habit' && payload.habit_id) {
       // Same trust boundary as the streak branch: record_habit_completion() is
@@ -363,7 +589,6 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
   return json({
     status: 'ok',
-    task_confirmed: taskConfirmed,
     habit_confirmed: habitConfirmed,
     streak,
     ...verdict,

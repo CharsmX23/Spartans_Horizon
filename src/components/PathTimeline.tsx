@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useState, FormEvent } from 'react';
-import { Plus, X, Check, Trash2, Pencil, ChevronDown, ChevronUp } from 'lucide-react';
-import { LearningPath } from '../lib/learning';
+import { useState, FormEvent } from 'react';
+import { Plus, Check, Trash2, Pencil, ChevronDown, ChevronUp } from 'lucide-react';
 import {
-  PathPhase, loadPathPhases, createPathPhase, updatePathPhase,
+  PathPhase, createPathPhase, updatePathPhase,
   deletePathPhase, movePhase, nextStatus, chainStartFrom,
 } from '../lib/pathPhases';
 import { TimelineNode, TimelineConnector, nodeAlignedLine } from './TimelineNode';
@@ -10,25 +9,34 @@ import { TimelineNode, TimelineConnector, nodeAlignedLine } from './TimelineNode
 /**
  * The phase timeline for a learning path — the same idea, and deliberately the same
  * shape, as the phases under a mission on the home screen (`PhaseTimeline` in
- * LowerSections.tsx). What it adds is a date range, a note, reordering, and editing in
- * place rather than only add and delete.
+ * LowerSections.tsx). The dot and the rail come from `TimelineNode`, shared by both, so
+ * the two stay identical by construction rather than by anyone remembering to.
  *
  * ── This owns no chrome ────────────────────────────────────────────────────────
  * It renders as a hairline-separated block *inside* the path card, not as a panel of its
- * own: no border, no background, no radius, and no expand toggle. `PathRow` decides when
- * it is mounted, so when a path is collapsed nothing here exists — no load, no error
- * banner, no Add-phase button. Give it a card of its own and it stops reading as part of
- * the path and starts competing with it.
+ * own: no border, no background, no radius, and no expand toggle. Since the modules and
+ * tasks section was removed it is the entire body of an expanded path, and giving it a
+ * card of its own would put a box inside a box for no reason.
  *
- * Phases are typed in by hand, in order: "Prototyping", "Evaluation". Each new one picks
- * up where the last one left off — `chainStartFrom` prefills its start as the day after
- * the previous phase's target — so a chain entered as a series of end dates still reads
- * as continuous work rather than as disconnected milestones.
+ * ── It does not fetch ──────────────────────────────────────────────────────────
+ * `phases` arrives as a prop and `run` reloads through the page. It used to load for
+ * itself, which was fine when the timeline was one section among several; it stopped
+ * being fine when the path's percentage became `completed / total` phases, because that
+ * number is on the collapsed row and cannot wait for a component that only mounts when
+ * the card opens. One fetch, in `loadPaths()`, and no way for the two to disagree.
  *
- * Status is a single-click cycle on the dot (pending -> live -> completed), the same
- * gesture as a mission phase, so there is nothing new to learn moving between the two.
- * Squadmates can see a path's phases but not touch them; `isOwner` hides the controls
- * and the grants in the migration are what actually enforce it.
+ * ── The dot is the whole interaction ───────────────────────────────────────────
+ * pending -> live -> completed -> pending, one click each, exactly like the mission
+ * timeline. For a while it was not: completion needed a photo that Gemini accepted, the
+ * dot could only reach `live`, and a camera button beside each row was the only way to
+ * finish a phase. That is removed — a learning path is a personal plan, and marking your
+ * own plan done is a checkbox, not a claim anyone else has to trust.
+ *
+ * The AI moved up to the path card as an advisor (the ✨ button in `PowerUpPage`): it
+ * reads this whole timeline and returns coaching text, and it cannot change a status.
+ * The per-phase coach button that used to live in this file is gone with it.
+ *
+ * Streak and habit proofs are unaffected and still require a photo — see `proof.ts`.
  */
 
 const WARN = '#FF4D2E';
@@ -53,34 +61,22 @@ interface PhaseValues {
   targetDate: string;
 }
 
-export default function PathTimeline({ path, isOwner }: { path: LearningPath; isOwner: boolean }) {
-  const [phases, setPhases] = useState<PathPhase[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+interface PathTimelineProps {
+  pathId: string;
+  phases: PathPhase[];
+  isOwner: boolean;
+  busy: boolean;
+  run: (action: () => Promise<{ error: string | null }>) => Promise<boolean>;
+}
+
+export default function PathTimeline(props: PathTimelineProps) {
+  const { pathId, phases, isOwner, busy, run } = props;
+
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    const { data, error: loadError } = await loadPathPhases(path.id);
-    if (loadError) { setError(loadError); setPhases([]); return; }
-    setPhases(data ?? []);
-  }, [path.id]);
-
-  useEffect(() => { void load(); }, [load]);
-
-  async function run(action: () => Promise<{ error: string | null }>) {
-    setBusy(true);
-    setError(null);
-    const { error: actionError } = await action();
-    if (actionError) setError(actionError);
-    else await load();
-    setBusy(false);
-    return !actionError;
-  }
-
-  const list = phases ?? [];
-  const nextOrder = list.length > 0 ? Math.max(...list.map((p) => p.order_index)) + 1 : 0;
-  const doneCount = list.filter((p) => p.status === 'completed').length;
+  const nextOrder = phases.length > 0 ? Math.max(...phases.map((p) => p.order_index)) + 1 : 0;
+  const doneCount = phases.filter((p) => p.status === 'completed').length;
 
   return (
     <div style={{
@@ -93,7 +89,7 @@ export default function PathTimeline({ path, isOwner }: { path: LearningPath; is
     }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
         <span className="tracked-sm" style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)' }}>
-          TIMELINE{list.length > 0 ? ` · ${doneCount}/${list.length}` : ''}
+          TIMELINE{phases.length > 0 ? ` · ${doneCount}/${phases.length}` : ''}
         </span>
         {isOwner && !adding && (
           <button
@@ -108,26 +104,9 @@ export default function PathTimeline({ path, isOwner }: { path: LearningPath; is
         )}
       </div>
 
-      {error && (
-        <div style={{
-          display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 11,
-          color: '#fca5a5', background: 'rgba(239,68,68,0.10)',
-          border: '1px solid rgba(239,68,68,0.30)', borderRadius: 10, padding: '7px 10px',
-        }}>
-          <span style={{ flex: 1 }}>{error}</span>
-          <button onClick={() => setError(null)} style={{ background: 'none', border: 'none', color: 'inherit', cursor: 'pointer' }}>
-            <X className="w-3 h-3" />
-          </button>
-        </div>
-      )}
-
-      {phases === null && (
-        <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>Loading phases…</div>
-      )}
-
-      {list.length > 0 && (
+      {phases.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: PHASE_GAP }}>
-          {list.map((phase, index) => (
+          {phases.map((phase, index) => (
             editingId === phase.id ? (
               <PhaseForm
                 key={phase.id}
@@ -156,12 +135,12 @@ export default function PathTimeline({ path, isOwner }: { path: LearningPath; is
                 phase={phase}
                 index={index}
                 isFirst={index === 0}
-                isLast={index === list.length - 1}
+                isLast={index === phases.length - 1}
                 isOwner={isOwner}
                 busy={busy}
                 onCycle={() => run(() => updatePathPhase(phase.id, { status: nextStatus(phase.status) }))}
                 onEdit={() => { setEditingId(phase.id); setAdding(false); }}
-                onMove={(dir) => run(() => movePhase(list, phase.id, dir))}
+                onMove={(dir) => run(() => movePhase(phases, phase.id, dir))}
                 onDelete={() => {
                   if (!confirm(`Delete phase "${phase.title}"?`)) return;
                   void run(() => deletePathPhase(phase.id));
@@ -172,7 +151,7 @@ export default function PathTimeline({ path, isOwner }: { path: LearningPath; is
         </div>
       )}
 
-      {phases !== null && list.length === 0 && !adding && (
+      {phases.length === 0 && !adding && (
         <p style={{ color: 'rgba(255,255,255,0.35)', fontSize: 11 }}>
           {isOwner
             ? 'No phases yet — break this path into stages like Prototyping, then Evaluation.'
@@ -188,14 +167,14 @@ export default function PathTimeline({ path, isOwner }: { path: LearningPath; is
           initial={{
             title: '',
             description: '',
-            startDate: chainStartFrom(list[list.length - 1]) ?? '',
+            startDate: chainStartFrom(phases[phases.length - 1]) ?? '',
             targetDate: '',
           }}
           submitLabel="Add phase"
           onCancel={() => setAdding(false)}
           onSubmit={async (values) => {
             const ok = await run(() => createPathPhase({
-              pathId: path.id,
+              pathId,
               title: values.title,
               description: values.description,
               startDate: values.startDate || null,
@@ -212,7 +191,9 @@ export default function PathTimeline({ path, isOwner }: { path: LearningPath; is
 
 /* ────────────────────────── Phase row ────────────────────────── */
 
-function PhaseRow({ phase, index, isFirst, isLast, isOwner, busy, onCycle, onEdit, onMove, onDelete }: {
+function PhaseRow({
+  phase, index, isFirst, isLast, isOwner, busy, onCycle, onEdit, onMove, onDelete,
+}: {
   phase: PathPhase;
   index: number;
   isFirst: boolean;
@@ -239,7 +220,11 @@ function PhaseRow({ phase, index, isFirst, isLast, isOwner, busy, onCycle, onEdi
         status={phase.status}
         disabled={busy}
         interactive={isOwner}
-        title={isOwner ? `Status: ${phase.status} — click to advance` : `Status: ${phase.status}`}
+        title={
+          isOwner
+            ? `Status: ${phase.status} — click to cycle pending → live → completed`
+            : `Status: ${phase.status}`
+        }
         onClick={onCycle}
       />
 

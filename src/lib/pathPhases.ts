@@ -13,6 +13,19 @@ import { supabase } from './supabase';
  * Writes never send `user_id` (the column default `auth.uid()` supplies it) and never
  * send `path_id` on UPDATE — both are outside the UPDATE grant, so a phase cannot be
  * reassigned or moved to another path from the client.
+ *
+ * ── `completed` is an ordinary write, and used not to be ────────────────────────
+ * For a while a phase could only reach `completed` through a photo that Gemini accepted:
+ * `set_phase_verified()` issued a ticket and a BEFORE trigger on `path_phases` rejected
+ * the transition from every other writer, so this file typed `status` as everything
+ * *except* `completed`.
+ *
+ * That is gone (`20260808120000_manual_phase_completion.sql`). A phase is a to-do item its
+ * owner ticks off, so all three statuses are plain column writes now, scoped to your own
+ * rows by RLS and to the safe columns by the UPDATE grant. `user_id` and `path_id` remain
+ * outside that grant, so a phase still cannot be reassigned or moved from the client.
+ *
+ * The streak and habit proofs are unaffected and stay photo-gated — see `proof.ts`.
  */
 
 export type PhaseStatus = 'pending' | 'live' | 'completed';
@@ -44,6 +57,26 @@ export async function loadPathPhases(pathId: string): Promise<Result<PathPhase[]
     .from('path_phases')
     .select(COLS)
     .eq('path_id', pathId)
+    .order('order_index', { ascending: true })
+    .order('created_at', { ascending: true });
+
+  return { data: (data as PathPhase[]) ?? null, error: error?.message ?? null };
+}
+
+/**
+ * Phases for several paths in one round trip, in timeline order.
+ *
+ * `loadPaths()` uses this to attach phases to every visible path up front, because a
+ * path's percentage is computed from them and is shown on the collapsed row — before
+ * any timeline is mounted. Callers filter by `path_id`.
+ */
+export async function loadPhasesForPaths(pathIds: string[]): Promise<Result<PathPhase[]>> {
+  if (pathIds.length === 0) return { data: [], error: null };
+
+  const { data, error } = await supabase
+    .from('path_phases')
+    .select(COLS)
+    .in('path_id', pathIds)
     .order('order_index', { ascending: true })
     .order('created_at', { ascending: true });
 
@@ -102,7 +135,14 @@ export async function deletePathPhase(id: string): Promise<Result<null>> {
   return { data: null, error: error?.message ?? null };
 }
 
-/** pending -> live -> completed -> pending, for a single-click status dot. */
+/**
+ * pending -> live -> completed -> pending, for a single-click status dot.
+ *
+ * Identical to `nextStatus` in `missionPhases.ts`, which is the point: the two timelines
+ * look the same, so clicking a dot has to mean the same thing in both. It briefly did not
+ * — while completion needed a photo this cycled pending <-> live only — and that is the
+ * state this returns from.
+ */
 export function nextStatus(status: PhaseStatus): PhaseStatus {
   return status === 'pending' ? 'live' : status === 'live' ? 'completed' : 'pending';
 }

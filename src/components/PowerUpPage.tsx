@@ -1,45 +1,52 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
-  Plus, X, Trash2, CheckCircle2, Circle, ChevronUp, ChevronDown, ChevronRight,
-  BookMarked, Sparkles, Clock, Users, Lock, Camera, Loader2,
+  Plus, X, Trash2, ChevronDown, ChevronRight, BookMarked, Clock, Users, Lock,
+  Sparkles, Loader2,
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/auth';
-import {
-  LearningPath, LearningModule, LearningTask, ProofType, PROOF_TYPES,
-  loadPaths, createPath, deletePath,
-  createModule, updateModule, deleteModule,
-  createTask, deleteTask,
-  setTaskDone, reorder, pathProgress,
-} from '../lib/learning';
-import { verifyProof, validateProofFile } from '../lib/proof';
+import { LearningPath, loadPaths, createPath, deletePath, pathProgress } from '../lib/learning';
+import { PathAdvice, requestPathAdvice } from '../lib/pathAdvice';
 import PathTimeline from './PathTimeline';
 
 /**
- * Power Up — manual CRUD over learning paths, modules, and tasks.
+ * Power Up — learning paths and the phase timeline underneath each one.
  *
- * Paths are built by hand (syllabus generation is still Phase 4). Tasks can be ticked
- * two ways: manually, or by submitting a photo that the `verify-proof` Edge Function
- * judges with Gemini — a passing verdict ticks the task server-side via set_task_done().
+ * ── What used to be here ───────────────────────────────────────────────────────
+ * A path owned `modules -> tasks`, and separately a phase timeline. Two hierarchies
+ * describing the same work in the same card, in two different vocabularies: a module was
+ * a stage of the path, and so was a phase. Both tables are dropped
+ * (`20260807120000_drop_learning_modules_tasks.sql`); the timeline is what remains,
+ * because it is the one already shared with missions on the home screen.
+ *
+ * An expanded path is now: description, timeframe, percentage, timeline. Nothing else.
+ *
+ * ── Progress is self-reported, deliberately ────────────────────────────────────
+ * The percentage is `completed phases / total phases`, derived on every render, stored
+ * nowhere. The owner marks a phase done by clicking its status dot — no photo, no gate.
+ *
+ * It briefly worked the other way: a phase reached `completed` only through a photo
+ * Gemini accepted, with a trigger on `path_phases` rejecting every other writer. That came
+ * out in `20260808120000_manual_phase_completion.sql`. A learning path is a private plan
+ * you are keeping for yourself, and needing to photograph your own to-do list to tick it
+ * off is friction bought with nothing. The daily streak is the opposite case — it is shown
+ * to squadmates as a claim about what happened — and it stays photo-verified.
+ *
+ * ── The AI advises, and cannot act ─────────────────────────────────────────────
+ * The ✨ button on a card sends the whole typed timeline — titles, descriptions, dates,
+ * statuses — and gets back coaching: whether these are the right topics for the goal, how
+ * progress reads, whether the dates are slipping against today, and what to do next. It
+ * writes nothing anywhere, and there is no branch from it to a status. See `pathAdvice.ts`.
  *
  * Squadmates' paths are visible but read-only. RLS and the column grants enforce that;
  * the UI only reflects it.
  *
  * ── One card per path ──────────────────────────────────────────────────────────
- * A path has exactly one representation on this page: a collapsed row that expands in
- * place, the same gesture and the same shape as a mission card on the home screen.
- * There used to be two — a picker row up top *and* a detached detail panel below for
- * whichever row was selected — which meant the path you were looking at appeared twice,
- * in two different styles, with no visual link between them. There is no "selected"
- * path any more, only an expanded one, and everything about a path lives inside its own
- * card: overview, progress, modules, tasks, and the phase timeline.
+ * A collapsed row that expands in place — the same gesture and the same shape as a
+ * mission card on the home screen. There is no "selected" path, only an expanded one.
  */
 
-const PROOF_COLORS: Record<ProofType, string> = {
-  text: '#38BDF8',
-  link: '#A78BFA',
-  photo: '#F5A524',
-};
+const ADVISOR = '#A78BFA';
 
 const panel: React.CSSProperties = {
   background: 'rgba(255,255,255,0.045)',
@@ -60,6 +67,9 @@ const inputStyle: React.CSSProperties = {
 
 type Run = (action: () => Promise<{ error: string | null }>) => Promise<boolean>;
 
+/** Advice for one path, success or failure. Local only — nothing here was persisted. */
+type AdviceState = { pathId: string; advice: PathAdvice | null; message: string | null };
+
 export default function PowerUpPage() {
   const { user } = useAuth();
   const myId = user?.id ?? null;
@@ -71,19 +81,14 @@ export default function PowerUpPage() {
   const [busy, setBusy] = useState(false);
 
   const [showNewPath, setShowNewPath] = useState(false);
-  // Which path is open. One at a time, so the list stays scannable — and the only piece
-  // of per-path UI state there is, now that opening a path is the whole interaction.
+  // Which path is open. One at a time, so the list stays scannable.
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [addingModuleTo, setAddingModuleTo] = useState<string | null>(null);
-  const [editingModule, setEditingModule] = useState<string | null>(null);
-  const [addingTaskTo, setAddingTaskTo] = useState<string | null>(null);
 
-  // Photo-proof verification. The pending task is held only long enough to attach the
-  // picked file to it; the image itself never leaves this call chain.
-  const proofInputRef = useRef<HTMLInputElement>(null);
-  const pendingTask = useRef<LearningTask | null>(null);
-  const [verifyingTaskId, setVerifyingTaskId] = useState<string | null>(null);
-  const [verdict, setVerdict] = useState<{ passed: boolean; text: string } | null>(null);
+  // The advisor writes nothing, so this state is the entire lifetime of a result:
+  // dismissing it, or asking again, is the only thing that ends it. One at a time —
+  // advice is read in the card it belongs to.
+  const [advisingId, setAdvisingId] = useState<string | null>(null);
+  const [advice, setAdvice] = useState<AdviceState | null>(null);
 
   const load = useCallback(async () => {
     const { data, error: loadError } = await loadPaths();
@@ -97,6 +102,7 @@ export default function PowerUpPage() {
     // A path that vanished (deleted here or by its owner) must not leave the page
     // holding an id that no longer resolves.
     setExpandedId((current) => (current && rows.some((p) => p.id === current) ? current : null));
+    setAdvice((current) => (current && rows.some((p) => p.id === current.pathId) ? current : null));
 
     // Squadmates' usernames, for attribution on shared paths.
     const otherIds = [...new Set(rows.map((p) => p.user_id))].filter((id) => id !== myId);
@@ -120,41 +126,22 @@ export default function PowerUpPage() {
     return !actionError;
   }, [load]);
 
-  /** Opens the picker for a task; the file lands in handleProofSelected below. */
-  const startProof = useCallback((task: LearningTask) => {
-    pendingTask.current = task;
-    setVerdict(null);
-    setError(null);
-    proofInputRef.current?.click();
-  }, []);
-
-  async function handleProofSelected(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    const task = pendingTask.current;
-    // Reset immediately so picking the same file twice still fires onChange.
-    if (proofInputRef.current) proofInputRef.current.value = '';
-    if (!file || !task) return;
-
-    const invalid = validateProofFile(file);
-    if (invalid) { setError(invalid); return; }
-
-    setVerifyingTaskId(task.id);
-    const result = await verifyProof({
-      file,
-      context: task.label,
-      kind: 'task',
-      taskId: task.id,
+  /**
+   * Ask the advisor about a path. Opens the card first — the answer is several paragraphs
+   * and belongs next to the timeline it is describing, not floating above a collapsed row.
+   */
+  const advise = useCallback(async (path: LearningPath) => {
+    setExpandedId(path.id);
+    setAdvice(null);
+    setAdvisingId(path.id);
+    const result = await requestPathAdvice(path);
+    setAdvisingId(null);
+    setAdvice({
+      pathId: path.id,
+      advice: result.ok ? result.advice : null,
+      message: result.ok ? null : result.message,
     });
-    setVerifyingTaskId(null);
-    pendingTask.current = null;
-
-    if (!result.ok) { setError(result.message); return; }
-
-    const passed = result.verdict.verdict === 'progress';
-    setVerdict({ passed, text: result.verdict.evaluation_text });
-    // The Edge Function already ticked it via set_task_done(); reload to reflect that.
-    if (passed && result.verdict.task_confirmed) await load();
-  }
+  }, []);
 
   if (loading) {
     return <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: 13, padding: 24 }}>Loading paths…</div>;
@@ -166,7 +153,7 @@ export default function PowerUpPage() {
         <div>
           <h1 style={{ color: '#fff', fontSize: 22, fontWeight: 700, margin: 0 }}>Power Up</h1>
           <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: 13, marginTop: 3 }}>
-            Build a learning path by hand — modules, tasks, and the proof each one needs.
+            Break a goal into phases and tick them off as you go. Ask the advisor how the plan is holding up.
           </p>
         </div>
         <button
@@ -194,36 +181,6 @@ export default function PowerUpPage() {
         </div>
       )}
 
-      {verdict && (
-        <div style={{
-          display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 12, borderRadius: 10,
-          padding: '10px 12px',
-          color: verdict.passed ? '#86efac' : '#fca5a5',
-          background: verdict.passed ? 'rgba(52,211,153,0.10)' : 'rgba(239,68,68,0.10)',
-          border: `1px solid ${verdict.passed ? 'rgba(52,211,153,0.30)' : 'rgba(239,68,68,0.30)'}`,
-        }}>
-          <span style={{ flex: 1 }}>
-            <strong>{verdict.passed ? 'Proof accepted — task ticked.' : 'Proof rejected.'}</strong>{' '}
-            {verdict.text}
-          </span>
-          <button
-            onClick={() => setVerdict(null)}
-            style={{ background: 'none', border: 'none', color: 'inherit', cursor: 'pointer' }}
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      )}
-
-      {/* One picker for every task; the image is read in memory and never stored. */}
-      <input
-        ref={proofInputRef}
-        type="file"
-        accept="image/*"
-        style={{ display: 'none' }}
-        onChange={handleProofSelected}
-      />
-
       {showNewPath && (
         <NewPathForm
           busy={busy}
@@ -242,7 +199,7 @@ export default function PowerUpPage() {
           <BookMarked className="w-8 h-8" style={{ color: 'rgba(255,255,255,0.25)', margin: '0 auto 12px' }} />
           <div style={{ color: 'rgba(255,255,255,0.7)', fontSize: 15, fontWeight: 600 }}>No learning paths yet</div>
           <p style={{ color: 'rgba(255,255,255,0.35)', fontSize: 12, marginTop: 4 }}>
-            Create one to start tracking modules and tasks.
+            Create one to start tracking phases.
           </p>
         </div>
       )}
@@ -259,14 +216,10 @@ export default function PowerUpPage() {
               onToggle={() => setExpandedId((current) => (current === p.id ? null : p.id))}
               busy={busy}
               run={run}
-              addingModuleTo={addingModuleTo}
-              setAddingModuleTo={setAddingModuleTo}
-              editingModule={editingModule}
-              setEditingModule={setEditingModule}
-              addingTaskTo={addingTaskTo}
-              setAddingTaskTo={setAddingTaskTo}
-              onVerifyTask={startProof}
-              verifyingTaskId={verifyingTaskId}
+              advising={advisingId === p.id}
+              advice={advice?.pathId === p.id ? advice : null}
+              onAdvise={() => void advise(p)}
+              onDismissAdvice={() => setAdvice(null)}
             />
           ))}
         </div>
@@ -277,13 +230,10 @@ export default function PowerUpPage() {
 
 /* ─────────────────────────── Path card ───────────────────────────
  * The only representation of a path on this page. Collapsed it is a single row — chevron,
- * title, progress — and pressing anywhere on that row expands it in place to reveal
- * everything: overview, counts, progress bar, modules and their tasks, and the phase
- * timeline. Deliberately the same gesture and the same anatomy as a mission card on the
- * home screen, so moving between the two teaches you nothing new.
- *
- * Nothing inside the expanded body is mounted while the card is shut, so a collapsed
- * path costs no query and shows no error banner of its own — just the chevron.
+ * title, progress — and pressing anywhere on that row expands it in place to reveal the
+ * rest: overview, timeframe, progress bar, and the phase timeline. Deliberately the same
+ * gesture and the same anatomy as a mission card on the home screen, so moving between
+ * the two teaches you nothing new.
  */
 
 interface PathCardProps {
@@ -294,21 +244,16 @@ interface PathCardProps {
   onToggle: () => void;
   busy: boolean;
   run: Run;
-  addingModuleTo: string | null;
-  setAddingModuleTo: (v: string | null) => void;
-  editingModule: string | null;
-  setEditingModule: (v: string | null) => void;
-  addingTaskTo: string | null;
-  setAddingTaskTo: (v: string | null) => void;
-  onVerifyTask: (task: LearningTask) => void;
-  verifyingTaskId: string | null;
+  advising: boolean;
+  advice: AdviceState | null;
+  onAdvise: () => void;
+  onDismissAdvice: () => void;
 }
 
 function PathCard(props: PathCardProps) {
   const {
     path, isOwner, ownerName, expanded, onToggle, busy, run,
-    addingModuleTo, setAddingModuleTo, editingModule, setEditingModule,
-    addingTaskTo, setAddingTaskTo, onVerifyTask, verifyingTaskId,
+    advising, advice, onAdvise, onDismissAdvice,
   } = props;
 
   const { done, total, percent } = pathProgress(path);
@@ -360,346 +305,173 @@ function PathCard(props: PathCardProps) {
         </button>
 
         {isOwner && (
-          <button
-            onClick={() => {
-              if (!confirm(`Delete "${path.title}" and all its modules and tasks?`)) return;
-              void run(() => deletePath(path.id));
-            }}
-            disabled={busy}
-            title="Delete path"
-            style={{
-              width: 28, height: 28, display: 'grid', placeItems: 'center', borderRadius: 9,
-              background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.25)',
-              color: '#fca5a5', cursor: 'pointer', flexShrink: 0,
-            }}
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </button>
+          <>
+            {/* The advisor. Reads the timeline, returns text, changes nothing. Disabled
+                with no phases because there would be no plan to have an opinion about. */}
+            <button
+              onClick={onAdvise}
+              disabled={advising || total === 0}
+              title={total === 0 ? 'Add a phase first' : 'Ask the AI advisor about this path'}
+              style={{
+                width: 28, height: 28, display: 'grid', placeItems: 'center', borderRadius: 9,
+                background: 'rgba(139,92,246,0.12)', border: '1px solid rgba(139,92,246,0.30)',
+                color: ADVISOR, flexShrink: 0,
+                cursor: advising || total === 0 ? 'not-allowed' : 'pointer',
+                opacity: advising || total === 0 ? 0.4 : 1,
+              }}
+            >
+              {advising
+                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                : <Sparkles className="w-3.5 h-3.5" />}
+            </button>
+
+            <button
+              onClick={() => {
+                if (!confirm(`Delete "${path.title}" and all its phases?`)) return;
+                void run(() => deletePath(path.id));
+              }}
+              disabled={busy}
+              title="Delete path"
+              style={{
+                width: 28, height: 28, display: 'grid', placeItems: 'center', borderRadius: 9,
+                background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.25)',
+                color: '#fca5a5', cursor: 'pointer', flexShrink: 0,
+              }}
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          </>
         )}
       </div>
 
       {/* ── Everything else, in place ── */}
       {expanded && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginTop: 12 }}>
-          <div>
-            {!isOwner && (
-              <span style={{
-                display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 10,
-                color: 'rgba(255,255,255,0.5)', background: 'rgba(255,255,255,0.06)',
-                border: '1px solid rgba(255,255,255,0.10)', borderRadius: 999, padding: '2px 8px',
-              }}>
-                <Lock className="w-3 h-3" /> @{ownerName ?? 'squadmate'} · read-only
-              </span>
-            )}
-
-            {path.overview && (
-              <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: 13, marginTop: 6, maxWidth: 680 }}>
-                {path.overview}
-              </p>
-            )}
-
-            <div style={{ display: 'flex', gap: 14, marginTop: 10, fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>
-              {path.total_timeline_weeks && (
-                <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <Clock className="w-3.5 h-3.5" /> {path.total_timeline_weeks} weeks
-                </span>
-              )}
-              <span>{path.modules.length} modules</span>
-              <span>{done}/{total} tasks done</span>
-            </div>
-
-            <div style={{
-              height: 6, borderRadius: 999, marginTop: 12,
-              background: 'rgba(255,255,255,0.07)', overflow: 'hidden',
+        <div style={{ display: 'flex', flexDirection: 'column', marginTop: 12 }}>
+          {!isOwner && (
+            <span style={{
+              display: 'inline-flex', alignSelf: 'flex-start', alignItems: 'center', gap: 4,
+              fontSize: 10, color: 'rgba(255,255,255,0.5)', background: 'rgba(255,255,255,0.06)',
+              border: '1px solid rgba(255,255,255,0.10)', borderRadius: 999, padding: '2px 8px',
             }}>
-              <div style={{ width: `${percent}%`, height: '100%', background: 'var(--accent)', transition: 'width .3s' }} />
-            </div>
-          </div>
-
-          {path.modules.map((mod, index) => (
-            <ModuleCard
-              key={mod.id}
-              module={mod}
-              path={path}
-              index={index}
-              isOwner={isOwner}
-              busy={busy}
-              run={run}
-              isEditing={editingModule === mod.id}
-              setEditing={(on) => setEditingModule(on ? mod.id : null)}
-              isAddingTask={addingTaskTo === mod.id}
-              setAddingTask={(on) => setAddingTaskTo(on ? mod.id : null)}
-              onVerifyTask={onVerifyTask}
-              verifyingTaskId={verifyingTaskId}
-            />
-          ))}
-
-          {isOwner && (
-            addingModuleTo === path.id ? (
-              <ModuleForm
-                busy={busy}
-                onCancel={() => setAddingModuleTo(null)}
-                onSubmit={async (values) => {
-                  const ok = await run(() =>
-                    createModule({ ...values, path_id: path.id, sort_order: path.modules.length }));
-                  if (ok) setAddingModuleTo(null);
-                }}
-              />
-            ) : (
-              <button
-                onClick={() => setAddingModuleTo(path.id)}
-                style={{
-                  ...panel, padding: '10px 16px', display: 'flex', alignItems: 'center',
-                  justifyContent: 'center', gap: 6, color: 'rgba(255,255,255,0.5)',
-                  fontSize: 13, cursor: 'pointer', borderStyle: 'dashed',
-                }}
-              >
-                <Plus className="w-4 h-4" /> Add module
-              </button>
-            )
+              <Lock className="w-3 h-3" /> @{ownerName ?? 'squadmate'} · read-only
+            </span>
           )}
 
+          {path.overview && (
+            <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: 13, marginTop: 6, maxWidth: 680 }}>
+              {path.overview}
+            </p>
+          )}
+
+          <div style={{ display: 'flex', gap: 14, marginTop: 10, fontSize: 11, color: 'rgba(255,255,255,0.4)' }}>
+            {path.total_timeline_weeks && (
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <Clock className="w-3.5 h-3.5" /> {path.total_timeline_weeks} weeks
+              </span>
+            )}
+            <span>{done}/{total} phases done</span>
+          </div>
+
+          <div style={{
+            height: 6, borderRadius: 999, marginTop: 12,
+            background: 'rgba(255,255,255,0.07)', overflow: 'hidden',
+          }}>
+            <div style={{ width: `${percent}%`, height: '100%', background: 'var(--accent)', transition: 'width .3s' }} />
+          </div>
+
+          {advice && <AdvicePanel state={advice} onDismiss={onDismissAdvice} />}
+
           {/* Draws its own hairline separator and no chrome of its own — it reads as the
-              tail of this card, exactly as the phase list does on a mission card. */}
-          <PathTimeline path={path} isOwner={isOwner} />
+              body of this card, exactly as the phase list does on a mission card. */}
+          <PathTimeline
+            pathId={path.id}
+            phases={path.phases}
+            isOwner={isOwner}
+            busy={busy}
+            run={run}
+          />
         </div>
       )}
     </section>
   );
 }
 
-/* ────────────────────────── Module card ────────────────────────── */
+/* ─────────────────────────── Advisor panel ───────────────────────────
+ * Advice, not a record. Nothing in here was written anywhere and dismissing it is the only
+ * thing that ends it — the same contract the per-phase coach had before it, stated in the
+ * component so it stays true if this moves.
+ */
 
-function ModuleCard({ module: mod, path, index, isOwner, busy, run, isEditing, setEditing, isAddingTask, setAddingTask, onVerifyTask, verifyingTaskId }: {
-  module: LearningModule;
-  path: LearningPath;
-  index: number;
-  isOwner: boolean;
-  busy: boolean;
-  run: Run;
-  isEditing: boolean;
-  setEditing: (v: boolean) => void;
-  isAddingTask: boolean;
-  setAddingTask: (v: boolean) => void;
-  onVerifyTask: (task: LearningTask) => void;
-  verifyingTaskId: string | null;
-}) {
-  const doneCount = mod.tasks.filter((t) => t.is_done).length;
+const ON_TRACK_LABEL: Record<PathAdvice['on_track'], { text: string; color: string; background: string }> = {
+  ahead:     { text: 'AHEAD',      color: '#86efac', background: 'rgba(52,211,153,0.12)' },
+  on_track:  { text: 'ON TRACK',   color: '#86efac', background: 'rgba(52,211,153,0.12)' },
+  behind:    { text: 'BEHIND',     color: '#FF4D2E', background: 'rgba(255,77,46,0.12)' },
+  unknown:   { text: 'NO DATES',   color: 'rgba(255,255,255,0.5)', background: 'rgba(255,255,255,0.06)' },
+};
 
-  if (isEditing) {
-    return (
-      <ModuleForm
-        busy={busy}
-        initial={mod}
-        onCancel={() => setEditing(false)}
-        onSubmit={async (values) => {
-          const ok = await run(() => updateModule(mod.id, values));
-          if (ok) setEditing(false);
-        }}
-      />
-    );
-  }
+function AdvicePanel({ state, onDismiss }: { state: AdviceState; onDismiss: () => void }) {
+  const failed = state.advice === null;
+  const badge = state.advice ? ON_TRACK_LABEL[state.advice.on_track] : null;
 
   return (
-    <section style={{ ...panel, padding: 18 }}>
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-        <span style={{
-          width: 24, height: 24, borderRadius: 8, display: 'grid', placeItems: 'center',
-          background: 'var(--accent-soft)', color: 'var(--accent)',
-          fontSize: 11, fontWeight: 700, flexShrink: 0, marginTop: 1,
-        }}>
-          {index + 1}
-        </span>
-
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <h3 style={{ color: '#fff', fontSize: 15, fontWeight: 600, margin: 0 }}>{mod.title}</h3>
-            {mod.estimated_days && (
-              <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)' }}>~{mod.estimated_days}d</span>
-            )}
-            <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.35)' }}>
-              {doneCount}/{mod.tasks.length}
-            </span>
-          </div>
-
-          {mod.why_it_matters && (
-            <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: 12, marginTop: 5, lineHeight: 1.55 }}>
-              {mod.why_it_matters}
-            </p>
-          )}
-
-          {mod.ai_leverage && (
-            <div style={{
-              display: 'flex', gap: 7, marginTop: 9, padding: '9px 11px', borderRadius: 10,
-              background: 'rgba(139,92,246,0.08)', border: '1px solid rgba(139,92,246,0.20)',
+    <div style={{
+      display: 'flex', gap: 8, marginTop: 12, padding: '11px 13px', borderRadius: 12,
+      background: failed ? 'rgba(239,68,68,0.08)' : 'rgba(139,92,246,0.08)',
+      border: `1px solid ${failed ? 'rgba(239,68,68,0.25)' : 'rgba(139,92,246,0.20)'}`,
+    }}>
+      <Sparkles
+        className="w-3.5 h-3.5"
+        style={{ color: failed ? '#fca5a5' : ADVISOR, flexShrink: 0, marginTop: 2 }}
+      />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span className="tracked-sm" style={{
+            fontSize: 9, fontWeight: 700, color: failed ? '#fca5a5' : ADVISOR,
+          }}>
+            {failed ? 'ADVISOR UNAVAILABLE' : 'PATH ADVISOR'}
+          </span>
+          {badge && (
+            <span style={{
+              fontSize: 9, fontWeight: 700, letterSpacing: '0.08em', borderRadius: 999,
+              padding: '2px 7px', color: badge.color, background: badge.background,
             }}>
-              <Sparkles className="w-3.5 h-3.5" style={{ color: '#A78BFA', flexShrink: 0, marginTop: 1 }} />
-              <div>
-                <div style={{ fontSize: 9, letterSpacing: '0.10em', color: '#A78BFA', fontWeight: 700 }}>
-                  AI LEVERAGE
-                </div>
-                <p style={{ color: 'rgba(255,255,255,0.6)', fontSize: 12, marginTop: 2, lineHeight: 1.5 }}>
-                  {mod.ai_leverage}
-                </p>
-              </div>
-            </div>
+              {badge.text}
+            </span>
           )}
         </div>
 
-        {isOwner && (
-          <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
-            <IconButton
-              title="Move up"
-              disabled={busy || index === 0}
-              onClick={() => void run(() => reorder('learning_modules', path.modules, mod.id, -1))}
-            >
-              <ChevronUp className="w-3.5 h-3.5" />
-            </IconButton>
-            <IconButton
-              title="Move down"
-              disabled={busy || index === path.modules.length - 1}
-              onClick={() => void run(() => reorder('learning_modules', path.modules, mod.id, 1))}
-            >
-              <ChevronDown className="w-3.5 h-3.5" />
-            </IconButton>
-            <IconButton title="Edit module" disabled={busy} onClick={() => setEditing(true)}>
-              <span style={{ fontSize: 10 }}>Edit</span>
-            </IconButton>
-            <IconButton
-              title="Delete module"
-              danger
-              disabled={busy}
-              onClick={() => {
-                if (!confirm(`Delete module "${mod.title}" and its ${mod.tasks.length} task(s)?`)) return;
-                void run(() => deleteModule(mod.id));
-              }}
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-            </IconButton>
-          </div>
-        )}
-      </div>
-
-      <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 2 }}>
-        {mod.tasks.map((task, taskIndex) => (
-          <div
-            key={task.id}
-            style={{
-              display: 'flex', alignItems: 'center', gap: 9,
-              padding: '7px 8px', borderRadius: 9,
-              background: task.is_done ? 'rgba(52,211,153,0.06)' : 'transparent',
-            }}
-          >
-            <button
-              onClick={() => void run(() => setTaskDone(task.id, !task.is_done))}
-              disabled={busy || !isOwner}
-              title={isOwner ? (task.is_done ? 'Mark not done' : 'Mark done') : 'Only the owner can tick this'}
-              style={{
-                background: 'none', border: 'none', padding: 0, flexShrink: 0,
-                cursor: isOwner ? 'pointer' : 'not-allowed',
-                color: task.is_done ? '#34D399' : 'rgba(255,255,255,0.28)',
-              }}
-            >
-              {task.is_done
-                ? <CheckCircle2 className="w-[18px] h-[18px]" />
-                : <Circle className="w-[18px] h-[18px]" />}
-            </button>
-
-            <span style={{
-              flex: 1, fontSize: 13, minWidth: 0,
-              color: task.is_done ? 'rgba(255,255,255,0.38)' : 'rgba(255,255,255,0.78)',
-              textDecoration: task.is_done ? 'line-through' : 'none',
-            }}>
-              {task.label}
-            </span>
-
-            <span
-              title={`Proof required: ${task.proof_type}`}
-              style={{
-                fontSize: 9, fontWeight: 700, letterSpacing: '0.08em', padding: '2px 7px',
-                borderRadius: 999, flexShrink: 0,
-                color: PROOF_COLORS[task.proof_type],
-                background: `${PROOF_COLORS[task.proof_type]}1a`,
-                border: `1px solid ${PROOF_COLORS[task.proof_type]}40`,
-              }}
-            >
-              {task.proof_type.toUpperCase()}
-            </span>
-
-            {isOwner && (
-              <div style={{ display: 'flex', gap: 3, flexShrink: 0 }}>
-                {/* Photo proof — Gemini judges the image against this task's label and
-                    ticks it via set_task_done() only on a passing verdict. */}
-                {!task.is_done && (
-                  <IconButton
-                    title={`Verify with a photo — judged against "${task.label}"`}
-                    disabled={busy || verifyingTaskId !== null}
-                    onClick={() => onVerifyTask(task)}
-                  >
-                    {verifyingTaskId === task.id
-                      ? <Loader2 className="w-3 h-3 animate-spin" />
-                      : <Camera className="w-3 h-3" />}
-                  </IconButton>
-                )}
-                <IconButton
-                  title="Move up"
-                  disabled={busy || taskIndex === 0}
-                  onClick={() => void run(() => reorder('learning_tasks', mod.tasks, task.id, -1))}
-                >
-                  <ChevronUp className="w-3 h-3" />
-                </IconButton>
-                <IconButton
-                  title="Move down"
-                  disabled={busy || taskIndex === mod.tasks.length - 1}
-                  onClick={() => void run(() => reorder('learning_tasks', mod.tasks, task.id, 1))}
-                >
-                  <ChevronDown className="w-3 h-3" />
-                </IconButton>
-                <IconButton
-                  title="Delete task"
-                  danger
-                  disabled={busy}
-                  onClick={() => void run(() => deleteTask(task.id))}
-                >
-                  <Trash2 className="w-3 h-3" />
-                </IconButton>
-              </div>
-            )}
-          </div>
-        ))}
-
-        {mod.tasks.length === 0 && (
-          <p style={{ color: 'rgba(255,255,255,0.28)', fontSize: 12, padding: '4px 8px' }}>
-            No tasks in this module yet.
+        {failed ? (
+          <p style={{ color: 'rgba(255,255,255,0.6)', fontSize: 12, marginTop: 4, lineHeight: 1.5 }}>
+            {state.message}
           </p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 6 }}>
+            <AdviceSection label="Topics" body={state.advice!.coverage} />
+            <AdviceSection label="Progress" body={state.advice!.progress} />
+            <AdviceSection label="Timing" body={state.advice!.timing} />
+            <AdviceSection label="Focus next" body={state.advice!.next} />
+          </div>
         )}
       </div>
+      <button
+        onClick={onDismiss}
+        title="Dismiss"
+        style={{ background: 'none', border: 'none', color: 'rgba(255,255,255,0.4)', cursor: 'pointer', padding: 0, alignSelf: 'flex-start' }}
+      >
+        <X className="w-3 h-3" />
+      </button>
+    </div>
+  );
+}
 
-      {isOwner && (
-        isAddingTask ? (
-          <TaskForm
-            busy={busy}
-            onCancel={() => setAddingTask(false)}
-            onSubmit={async (values) => {
-              const ok = await run(() =>
-                createTask({ ...values, module_id: mod.id, sort_order: mod.tasks.length }));
-              if (ok) setAddingTask(false);
-            }}
-          />
-        ) : (
-          <button
-            onClick={() => setAddingTask(true)}
-            style={{
-              marginTop: 8, display: 'flex', alignItems: 'center', gap: 5,
-              background: 'none', border: 'none', cursor: 'pointer',
-              color: 'rgba(255,255,255,0.4)', fontSize: 12, padding: '4px 8px',
-            }}
-          >
-            <Plus className="w-3.5 h-3.5" /> Add task
-          </button>
-        )
-      )}
-    </section>
+function AdviceSection({ label, body }: { label: string; body: string }) {
+  return (
+    <div>
+      <div style={{ fontSize: 10, fontWeight: 700, color: 'rgba(255,255,255,0.45)' }}>{label}</div>
+      <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: 12, marginTop: 1, lineHeight: 1.55 }}>
+        {body}
+      </p>
+    </div>
   );
 }
 
@@ -738,190 +510,34 @@ function NewPathForm({ busy, onCancel, onSubmit }: {
         inputMode="numeric"
         style={{ ...inputStyle, width: 220 }}
       />
-      <FormActions
-        busy={busy}
-        disabled={!title.trim()}
-        submitLabel="Create Path"
-        onCancel={onCancel}
-        onSubmit={() => onSubmit({
-          title,
-          overview,
-          total_timeline_weeks: weeks ? Number(weeks) : null,
-        })}
-      />
-    </section>
-  );
-}
-
-function ModuleForm({ busy, initial, onCancel, onSubmit }: {
-  busy: boolean;
-  initial?: LearningModule;
-  onCancel: () => void;
-  onSubmit: (values: { title: string; why_it_matters: string; ai_leverage: string; estimated_days: number | null }) => void;
-}) {
-  const [title, setTitle] = useState(initial?.title ?? '');
-  const [why, setWhy] = useState(initial?.why_it_matters ?? '');
-  const [leverage, setLeverage] = useState(initial?.ai_leverage ?? '');
-  const [days, setDays] = useState(initial?.estimated_days?.toString() ?? '');
-
-  return (
-    <section style={{ ...panel, padding: 18, display: 'flex', flexDirection: 'column', gap: 10 }}>
-      <div style={{ color: '#fff', fontSize: 14, fontWeight: 600 }}>
-        {initial ? 'Edit module' : 'New module'}
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button
+          onClick={() => onSubmit({
+            title,
+            overview,
+            total_timeline_weeks: weeks ? Number(weeks) : null,
+          })}
+          disabled={busy || !title.trim()}
+          style={{
+            padding: '8px 16px', borderRadius: 10, border: 'none',
+            background: 'var(--accent)', color: '#fff', fontSize: 13, fontWeight: 600,
+            cursor: busy || !title.trim() ? 'not-allowed' : 'pointer',
+            opacity: busy || !title.trim() ? 0.5 : 1,
+          }}
+        >
+          {busy ? 'Saving…' : 'Create Path'}
+        </button>
+        <button
+          onClick={onCancel}
+          style={{
+            padding: '8px 16px', borderRadius: 10, cursor: 'pointer',
+            background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.10)',
+            color: 'rgba(255,255,255,0.6)', fontSize: 13,
+          }}
+        >
+          Cancel
+        </button>
       </div>
-      <input
-        value={title}
-        onChange={(e) => setTitle(e.target.value)}
-        placeholder="Module title"
-        style={inputStyle}
-        autoFocus
-      />
-      <textarea
-        value={why}
-        onChange={(e) => setWhy(e.target.value)}
-        placeholder="Why it matters"
-        rows={2}
-        style={{ ...inputStyle, resize: 'vertical' }}
-      />
-      <textarea
-        value={leverage}
-        onChange={(e) => setLeverage(e.target.value)}
-        placeholder="AI leverage — how to use AI tools to learn or apply this faster"
-        rows={2}
-        style={{ ...inputStyle, resize: 'vertical' }}
-      />
-      <input
-        value={days}
-        onChange={(e) => setDays(e.target.value.replace(/[^0-9]/g, ''))}
-        placeholder="Estimated days (optional)"
-        inputMode="numeric"
-        style={{ ...inputStyle, width: 220 }}
-      />
-      <FormActions
-        busy={busy}
-        disabled={!title.trim()}
-        submitLabel={initial ? 'Save' : 'Add Module'}
-        onCancel={onCancel}
-        onSubmit={() => onSubmit({
-          title,
-          why_it_matters: why,
-          ai_leverage: leverage,
-          estimated_days: days ? Number(days) : null,
-        })}
-      />
     </section>
-  );
-}
-
-function TaskForm({ busy, onCancel, onSubmit }: {
-  busy: boolean;
-  onCancel: () => void;
-  onSubmit: (values: { label: string; proof_type: ProofType }) => void;
-}) {
-  const [label, setLabel] = useState('');
-  const [proofType, setProofType] = useState<ProofType>('text');
-
-  return (
-    <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
-      <input
-        value={label}
-        onChange={(e) => setLabel(e.target.value)}
-        placeholder="Task — what does done look like?"
-        onKeyDown={(e) => { if (e.key === 'Enter' && label.trim()) onSubmit({ label, proof_type: proofType }); }}
-        style={{ ...inputStyle, flex: 1, minWidth: 200 }}
-        autoFocus
-      />
-      <select
-        value={proofType}
-        onChange={(e) => setProofType(e.target.value as ProofType)}
-        title="Proof required to tick this off (enforced in Phase 4)"
-        style={{ ...inputStyle, width: 100, cursor: 'pointer' }}
-      >
-        {PROOF_TYPES.map((t) => (
-          <option key={t} value={t} style={{ background: '#12100d' }}>{t}</option>
-        ))}
-      </select>
-      <button
-        onClick={() => onSubmit({ label, proof_type: proofType })}
-        disabled={busy || !label.trim()}
-        style={{
-          padding: '0 14px', borderRadius: 10, border: 'none', cursor: 'pointer',
-          background: 'var(--accent)', color: '#fff', fontSize: 12, fontWeight: 600,
-        }}
-      >
-        Add
-      </button>
-      <button
-        onClick={onCancel}
-        style={{
-          padding: '0 12px', borderRadius: 10, cursor: 'pointer',
-          background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.10)',
-          color: 'rgba(255,255,255,0.6)', fontSize: 12,
-        }}
-      >
-        Cancel
-      </button>
-    </div>
-  );
-}
-
-function FormActions({ busy, disabled, submitLabel, onCancel, onSubmit }: {
-  busy: boolean;
-  disabled: boolean;
-  submitLabel: string;
-  onCancel: () => void;
-  onSubmit: () => void;
-}) {
-  return (
-    <div style={{ display: 'flex', gap: 8 }}>
-      <button
-        onClick={onSubmit}
-        disabled={busy || disabled}
-        style={{
-          padding: '8px 16px', borderRadius: 10, border: 'none',
-          background: 'var(--accent)', color: '#fff', fontSize: 13, fontWeight: 600,
-          cursor: busy || disabled ? 'not-allowed' : 'pointer',
-          opacity: busy || disabled ? 0.5 : 1,
-        }}
-      >
-        {busy ? 'Saving…' : submitLabel}
-      </button>
-      <button
-        onClick={onCancel}
-        style={{
-          padding: '8px 16px', borderRadius: 10, cursor: 'pointer',
-          background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.10)',
-          color: 'rgba(255,255,255,0.6)', fontSize: 13,
-        }}
-      >
-        Cancel
-      </button>
-    </div>
-  );
-}
-
-function IconButton({ children, onClick, disabled, danger, title }: {
-  children: React.ReactNode;
-  onClick: () => void;
-  disabled?: boolean;
-  danger?: boolean;
-  title?: string;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      style={{
-        minWidth: 24, height: 24, padding: '0 5px', display: 'grid', placeItems: 'center',
-        borderRadius: 7, cursor: disabled ? 'not-allowed' : 'pointer',
-        background: danger ? 'rgba(239,68,68,0.10)' : 'rgba(255,255,255,0.05)',
-        border: `1px solid ${danger ? 'rgba(239,68,68,0.25)' : 'rgba(255,255,255,0.10)'}`,
-        color: danger ? '#fca5a5' : 'rgba(255,255,255,0.55)',
-        opacity: disabled ? 0.35 : 1,
-      }}
-    >
-      {children}
-    </button>
   );
 }

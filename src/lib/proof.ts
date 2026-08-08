@@ -19,8 +19,6 @@ export interface StreakState {
 export interface ProofVerdict {
   verdict: 'progress' | 'no_progress';
   evaluation_text: string;
-  /** True when the function successfully ticked the task via set_task_done(). */
-  task_confirmed: boolean;
   /** True when the function recorded a habit completion via record_habit_completion(). */
   habit_confirmed: boolean;
   /**
@@ -58,11 +56,9 @@ function toBase64(file: File): Promise<{ base64: string; mimeType: string }> {
 
 export async function verifyProof(input: {
   file: File;
-  /** The goal, task, or habit label the photo is judged against. */
+  /** The goal or habit the photo is judged against. */
   context: string;
-  kind: 'streak' | 'task' | 'habit';
-  /** Required for kind 'task' — the function ticks this on a pass. */
-  taskId?: string;
+  kind: 'streak' | 'habit';
   /** Required for kind 'habit' — the function records a completion for this on a pass. */
   habitId?: string;
 }): Promise<ProofResult> {
@@ -75,7 +71,6 @@ export async function verifyProof(input: {
         mime_type: mimeType,
         context: input.context,
         kind: input.kind,
-        task_id: input.taskId,
         habit_id: input.habitId,
       },
     });
@@ -104,7 +99,6 @@ export async function verifyProof(input: {
         verdict: {
           verdict: body.verdict,
           evaluation_text: body.evaluation_text,
-          task_confirmed: body.task_confirmed,
           habit_confirmed: body.habit_confirmed,
           streak: body.streak ?? null,
         },

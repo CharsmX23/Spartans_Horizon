@@ -5,6 +5,7 @@ import {
   deletePathPhase, movePhase, nextStatus, chainStartFrom,
 } from '../lib/pathPhases';
 import { TimelineNode, TimelineConnector, nodeAlignedLine } from './TimelineNode';
+import { bumpXp } from '../lib/xp';
 
 /**
  * The phase timeline for a learning path — the same idea, and deliberately the same
@@ -138,12 +139,21 @@ export default function PathTimeline(props: PathTimelineProps) {
                 isLast={index === phases.length - 1}
                 isOwner={isOwner}
                 busy={busy}
-                onCycle={() => run(() => updatePathPhase(phase.id, { status: nextStatus(phase.status) }))}
+                onCycle={async () => {
+                  const ok = await run(() => updatePathPhase(phase.id, { status: nextStatus(phase.status) }));
+                  // Phase XP mirrors `status` (20260813150000): reaching `completed` grants
+                  // 100 via path_phases_xp, leaving it takes the same 100 back via
+                  // path_phases_xp_revoke. Either way the UPDATE returns no sign of it, so
+                  // the header refetches on every step of the cycle.
+                  if (ok) bumpXp();
+                }}
                 onEdit={() => { setEditingId(phase.id); setAdding(false); }}
                 onMove={(dir) => run(() => movePhase(phases, phase.id, dir))}
-                onDelete={() => {
+                onDelete={async () => {
                   if (!confirm(`Delete phase "${phase.title}"?`)) return;
-                  void run(() => deletePathPhase(phase.id));
+                  const ok = await run(() => deletePathPhase(phase.id));
+                  // A deleted phase that was completed takes its 100 XP with it.
+                  if (ok) bumpXp();
                 }}
               />
             )

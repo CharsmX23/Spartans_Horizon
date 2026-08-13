@@ -6,6 +6,7 @@ import {
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/auth';
 import { LearningPath, loadPaths, createPath, deletePath, pathProgress } from '../lib/learning';
+import { bumpXp } from '../lib/xp';
 import { PathAdvice, requestPathAdvice } from '../lib/pathAdvice';
 import PathTimeline from './PathTimeline';
 
@@ -326,9 +327,12 @@ function PathCard(props: PathCardProps) {
             </button>
 
             <button
-              onClick={() => {
+              onClick={async () => {
                 if (!confirm(`Delete "${path.title}" and all its phases?`)) return;
-                void run(() => deletePath(path.id));
+                const ok = await run(() => deletePath(path.id));
+                // The phases cascade-delete with the path, and each completed one revokes
+                // its 100 XP on the way out — so this can move the header by a lot at once.
+                if (ok) bumpXp();
               }}
               disabled={busy}
               title="Delete path"

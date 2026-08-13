@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { X, Plus, Pencil, Check, RotateCcw, EyeOff } from 'lucide-react';
+import { X, Plus, Pencil, Check, RotateCcw, EyeOff, Activity } from 'lucide-react';
 import {
   Habit, HABIT_ICON_NAMES, habitIcon,
   loadAllHabits, createHabit, updateHabit, setHabitActive,
@@ -145,6 +145,7 @@ export default function HabitManager({ open, accent, onClose, onChanged }: Props
                   busy={busy}
                   onRename={(title) => run(() => updateHabit(h.id, { title }))}
                   onPickIcon={(icon) => run(() => updateHabit(h.id, { icon }))}
+                  onSetPhysical={(on) => run(() => updateHabit(h.id, { is_physical: on }))}
                   onRemove={() => run(() => setHabitActive(h.id, false))}
                 />
               ))}
@@ -211,12 +212,13 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 }
 
 /** An active habit: rename inline, swap its icon, or remove behind a confirm step. */
-function ManagerRow({ habit, accent, busy, onRename, onPickIcon, onRemove }: {
+function ManagerRow({ habit, accent, busy, onRename, onPickIcon, onSetPhysical, onRemove }: {
   habit: Habit;
   accent: string;
   busy: boolean;
   onRename: (title: string) => Promise<boolean>;
   onPickIcon: (icon: string) => Promise<boolean>;
+  onSetPhysical: (on: boolean) => Promise<boolean>;
   onRemove: () => Promise<boolean>;
 }) {
   const [mode, setMode] = useState<'view' | 'edit' | 'confirm'>('view');
@@ -330,6 +332,29 @@ function ManagerRow({ habit, accent, busy, onRename, onPickIcon, onRemove }: {
           )}
         </div>
       </div>
+
+      {/* Physical-activity flag. Always visible, not tucked behind edit mode, because
+          what a habit pays should be readable at a glance rather than discovered. The
+          amounts are read server-side from this column — the labels here are a mirror of
+          the rule in record_habit_completion(), never the source of it. */}
+      <button
+        onClick={() => { void onSetPhysical(!habit.is_physical); }}
+        disabled={busy}
+        title={habit.is_physical
+          ? 'Counts as physical activity — a verified proof pays 100 XP'
+          : 'Standard habit — a verified proof pays 50 XP'}
+        className="self-start flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-bold transition hover:brightness-125 disabled:opacity-40"
+        style={{
+          background: habit.is_physical ? `${accent}1f` : 'rgba(255,255,255,0.04)',
+          border: `1px solid ${habit.is_physical ? `${accent}55` : 'rgba(255,255,255,0.08)'}`,
+          color: habit.is_physical ? accent : 'rgba(255,255,255,0.4)',
+          letterSpacing: '0.08em',
+          cursor: 'pointer',
+        }}
+      >
+        <Activity className="w-3 h-3" />
+        {habit.is_physical ? 'PHYSICAL · 100 XP' : 'STANDARD · 50 XP'}
+      </button>
 
       {mode === 'edit' && (
         <IconPicker value={habit.icon} accent={accent} onPick={(icon) => { void onPickIcon(icon); }} />

@@ -1,6 +1,8 @@
-import { Bell, Users, Search, Command } from 'lucide-react';
 import { Person } from '../data';
 import { ACCENTS } from '../theme';
+import { useXp, XpState } from '../lib/xp';
+import { useAuth } from '../lib/auth';
+import Avatar from './Avatar';
 
 interface Props {
   user: Person;
@@ -44,8 +46,69 @@ function SpartanLogo({ accent }: { accent: string }) {
   );
 }
 
+/**
+ * The XP meter that replaced the search bar.
+ *
+ * Level is computed from `sum(xp_events.amount)` on every read — there is no stored level
+ * and no optimistic guess. Until the first read lands the bar renders empty rather than
+ * showing a placeholder number, because a wrong level for 200ms is the exact class of
+ * fiction this replaced ("Lv.24", hardcoded, for months).
+ *
+ * Every number here comes off the single XpState from useXp(), including the rail's
+ * denominator — the curve rises (level n costs 50·n), so `levelSpan` is 50 at level 1 and
+ * 150 at level 3. Nothing in this file knows the formula; hardcoding a 50 back into the
+ * "x / y" readout is the one change that would silently desync the header from Settings.
+ *
+ * Three animations, all CSS so `prefers-reduced-motion` in index.css disables them
+ * without any JS: the fill eases to its new width when a grant lands, a sheen travels
+ * across the filled portion, and the whole rail breathes at the accent colour.
+ */
+function XpMeter({ accentHex, xp }: { accentHex: string; xp: XpState | null }) {
+  const shown = xp;
+
+  return (
+    <div className="flex items-center gap-3 min-w-0">
+      {/* Level badge — one line, same pill language as the ALPHA chip in the wordmark. */}
+      <div
+        className="shrink-0 flex items-center gap-1.5 rounded-lg px-2.5 h-7"
+        style={{
+          background: `linear-gradient(160deg, ${accentHex}2e, ${accentHex}0d)`,
+          border: `1px solid ${accentHex}55`,
+          boxShadow: `0 0 18px -6px ${accentHex}, inset 0 1px 0 rgba(255,255,255,0.12)`,
+        }}
+      >
+        <span className="text-[9px] font-bold tracked-sm leading-none" style={{ color: `${accentHex}cc` }}>
+          LEVEL
+        </span>
+        <span className="text-white font-extrabold leading-none text-[13px] tabular-nums">
+          {shown ? shown.level : '—'}
+        </span>
+      </div>
+
+      {/* Rail */}
+      <div className="flex-1 min-w-0">
+        <div className="flex items-baseline justify-between mb-1 gap-2">
+          <span className="text-[9px] font-bold tracked-sm text-white/40">
+            {shown ? `${shown.toNext} XP TO LEVEL ${shown.level + 1}` : 'SYNCING…'}
+          </span>
+          <span className="text-[9px] font-bold tabular-nums shrink-0" style={{ color: accentHex }}>
+            {shown ? `${shown.intoLevel} / ${shown.levelSpan}` : ''}
+          </span>
+        </div>
+        <div className="xp-rail" style={{ ['--xp-accent' as string]: accentHex }}>
+          <div className="xp-fill" style={{ width: `${(shown?.fraction ?? 0) * 100}%` }}>
+            <span className="xp-sheen" />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function TopBar({ user, onOpenSettings }: Props) {
   const accent = ACCENTS[user.accent];
+  const { xp } = useXp();
+  const { avatarUrl } = useAuth();
   return (
     <header className="sticky top-0 z-30 flex items-center gap-4 px-4 md:px-6 h-16 bg-ink/70 backdrop-blur-xl border-b border-white/5">
       {/* Logo — Spartan Shield + wordmark */}
@@ -67,37 +130,23 @@ export default function TopBar({ user, onOpenSettings }: Props) {
         </div>
       </div>
 
-      {/* Search */}
-      <div className="flex-1 max-w-xl mx-auto hidden md:block">
-        <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40" />
-          <input
-            placeholder="Search missions, ideas, tech, members…"
-            className="w-full bg-white/5 border border-white/10 rounded-full pl-10 pr-16 py-2 text-sm text-white/80 placeholder:text-white/30 focus:outline-none focus:border-white/25 transition"
-          />
-          <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-white/35 border border-white/10 rounded px-1.5 py-0.5 flex items-center gap-1">
-            <Command className="w-3 h-3" />K
-          </span>
-        </div>
+      {/* XP / level — stands where the search bar used to. */}
+      <div className="flex-1 max-w-sm mx-auto min-w-0">
+        <XpMeter accentHex={accent.hex} xp={xp} />
       </div>
 
       {/* Right */}
       <div className="flex items-center gap-3 md:gap-4 shrink-0 ml-auto">
-        <button className="relative w-5 h-5 grid place-items-center text-white/70 hover:text-white transition">
-          <Bell className="w-5 h-5" />
-          <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full" style={{ background: accent.hex, boxShadow: `0 0 6px ${accent.hex}` }} />
-        </button>
-        <button className="w-5 h-5 grid place-items-center text-white/70 hover:text-white transition">
-          <Users className="w-5 h-5" />
-        </button>
         <button
           onClick={onOpenSettings}
           className="flex items-center gap-2.5 pl-1 pr-3 py-1 rounded-full hover:bg-white/5 transition"
         >
-          <img src={user.avatar} alt={user.name} className="w-8 h-8 rounded-full ring-1 ring-white/10" />
+          <Avatar url={avatarUrl} name={user.name} accentHex={accent.hex} size={32} />
           <div className="hidden sm:flex flex-col leading-tight text-left">
             <span className="text-white text-sm font-semibold">{user.name}</span>
-            <span className="text-[10px]" style={{ color: accent.hex }}>Lv.{user.level}</span>
+            <span className="text-[10px] tabular-nums" style={{ color: accent.hex }}>
+              {xp ? `${xp.total.toLocaleString()} XP` : '—'}
+            </span>
           </div>
         </button>
       </div>

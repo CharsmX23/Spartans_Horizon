@@ -218,7 +218,7 @@ ALTER TABLE profile_settings ENABLE ROW LEVEL SECURITY;
 
 
 -- ============================================================================
--- 20260720170623_20260720_fix_rls_security_issues.sql.sql
+-- 20260720170623_fix_rls_security_issues.sql
 -- ============================================================================
 
 /*
@@ -1995,5 +1995,1220 @@ BEGIN;
   SELECT id, status FROM path_phases WHERE id = '<phase-uuid>';  -- completed
 ROLLBACK;
 */
+*/
+
+
+-- ============================================================================
+-- 20260813120000_drop_journal_entries.sql
+-- ============================================================================
+
+/*
+  # Drop journal_entries
+
+  `journal_entries` was created by 20260719114729 and re-policied by 20260720170623,
+  but the table was later removed from the hosted database by hand, and JournalPage
+  was removed from the frontend. Nothing in src/ references it.
+
+  That left the repo and the live database disagreeing: replaying migrations into a
+  fresh project produced a table production did not have. This migration closes the
+  gap from the repo side, so a fresh replay lands exactly where production already is.
+
+  Idempotent: DROP ... IF EXISTS is a no-op against the hosted project (the table is
+  already gone) and drops the table, its RLS policies, and its indexes in a fresh one.
+*/
+
+DROP TABLE IF EXISTS public.journal_entries CASCADE;
+
+
+-- ============================================================================
+-- 20260813130000_xp_events.sql
+-- ============================================================================
+
+/*
+# xp_events — a forge-proof XP ledger, and the real level behind "Lv.24"
+
+`Person.level` has been a hardcoded `24` in `src/data.ts` since the app was scaffolded.
+This is the table that makes it real. Level is never stored: it is
+`floor(sum(amount) / 50) + 1`, recomputed from this ledger on every read, so there is no
+number anywhere that can drift from the events that produced it.
+
+## The problem this table solves
+
+`20260808120000_manual_phase_completion.sql` deliberately dropped the trigger that
+narrowed `path_phases.status`, because a phase is a to-do item the owner ticks off by
+hand. That decision stands and nothing here reverses it. But it means `status` is a freely
+client-writable column, and "100 XP when a phase completes" naively implemented against a
+freely-writable column is an infinite XP faucet: PATCH pending, PATCH completed, repeat.
+
+The fix is not to re-gate the column — that would take back the manual control this app
+chose on purpose. The fix is to make the *grant* idempotent instead of the *write*:
+
+  - The triggers below are AFTER triggers. They react; they never block. Every status
+    write that succeeds today still succeeds after this migration, with the same error
+    behaviour and the same grants.
+  - `UNIQUE (source_type, source_id)` on this ledger is what actually stops the faucet.
+    XP for one specific phase row can only ever be inserted once, no matter how many
+    times that row's status is toggled.
+
+That is the same idempotency shape `habit_completions` already uses with
+`UNIQUE (user_id, habit_id, log_date)` — a uniqueness constraint standing in for a
+permission check, because the thing being protected is "how many times", not "by whom".
+
+## Objects created
+- TABLE    xp_events
+- FUNCTION grant_xp(uuid, text, uuid, int)                — the single insert path
+- FUNCTION path_phases_grant_xp()  + TRIGGER on path_phases
+- FUNCTION goals_grant_xp()        + TRIGGER on goals
+- COLUMN   habits.is_physical
+- FUNCTION record_checkin(uuid, text, date, boolean)      — REPLACES the 3-arg version
+- FUNCTION record_habit_completion(uuid, uuid, text)      — body changed, signature same
+- FUNCTION seed_default_habits(uuid)                      — body changed, signature same
+
+## THIS DOES NOT TOUCH ANY EXISTING PERMISSION
+Not one GRANT, REVOKE, or POLICY on `path_phases`, `goals`, `habits`, `streak_logs`,
+`habit_completions`, or `users` is widened or narrowed by this file. The only grant
+*changed* is `habits`' UPDATE column list, which gains `is_physical` — a new column that
+did not exist before. Phase status stays client-writable. Goal status stays
+client-writable. Streaks and habit completions stay service_role-only and photo-gated.
+The verify section at the bottom asserts all of that rather than asking you to trust it.
+
+## Two design notes worth reading before you apply this
+
+### 1. A habit tick writes TWO rows, and only one of them may pay out
+`record_habit_completion()` calls `record_checkin()` — ticking a habit *is* that day's
+check-in (see 20260731170000). So one photo of a habit produces a `habit_completions` row
+AND a `streak_logs` row. Granting XP off both would make one habit photo worth 100 XP
+while one bare streak photo is worth 50, for identical effort.
+
+So `record_checkin()` gains a `p_grant_xp boolean DEFAULT true` parameter, and the habit
+path passes `false`: the habit completion pays, the streak row it incidentally creates
+does not. A bare streak check-in from the Streaks page still pays its 50. One proof, one
+payout, whichever door it came through.
+
+This is why `record_checkin` is DROPped and recreated rather than CREATE OR REPLACEd —
+you cannot add a parameter with REPLACE. Both callers (`verify-proof` and
+`record_habit_completion`) pass arguments by name, so both keep working unchanged and the
+Edge Function does NOT need redeploying.
+
+### 2. `source_id` is unique on its own, not just per source_type
+The spec for this table said `UNIQUE (source_type, source_id)`, and that constraint is
+here under that name. But it has a hole: `habits.is_physical` is editable, so the same
+`habit_completions` row could be graded 'proof' (50) in the morning and 'habit_physical'
+(100) after you flip the toggle — two different `source_type`s, same `source_id`, both
+inserts pass. `UNIQUE (source_id)` is added alongside it to close that. The composite one
+is kept because it states the intent; the single-column one is what enforces it.
+
+### 3. Known residual: delete-and-recreate is still a faucet
+This ledger makes a *row* pay out once. It cannot stop you deleting a completed goal and
+creating a new one — new uuid, new payout. No constraint on this table can, because the
+new row is genuinely a different thing. Closing it needs a rate cap (e.g. at most N
+`goal_*` grants per day per user), which is a product decision, not a schema one, and is
+deliberately NOT implemented here. Flagging it so it is a choice rather than a surprise.
+*/
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 1. The ledger
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+`source_id` carries no foreign key, and that is deliberate twice over:
+
+  - It points at five different tables (streak_logs, habit_completions, path_phases,
+    goals), so no single REFERENCES can express it.
+  - Even if it could, ON DELETE CASCADE would be wrong: deleting a goal must not refund
+    the XP it already paid. History is history. A ledger that can be rewritten by
+    deleting its subject is not a ledger.
+
+The cost is that `source_id` may point at a row that no longer exists. Nothing reads
+through it — the balance is `sum(amount)` and never a join — so that costs nothing.
+*/
+CREATE TABLE IF NOT EXISTS xp_events (
+  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id      uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  source_type  text NOT NULL
+                 CHECK (source_type IN ('proof', 'habit_physical', 'phase', 'goal_short', 'goal_long')),
+  source_id    uuid NOT NULL,
+  amount       int  NOT NULL CHECK (amount > 0),
+  created_at   timestamptz NOT NULL DEFAULT now(),
+
+  -- The named idempotency constraint: one grant per source row per kind.
+  CONSTRAINT xp_events_source_unique UNIQUE (source_type, source_id),
+  -- The one that actually holds, per design note 2 above: one grant per source row,
+  -- full stop, regardless of how it is later reclassified.
+  CONSTRAINT xp_events_source_id_unique UNIQUE (source_id)
+);
+
+-- The only query the app runs against this table.
+CREATE INDEX IF NOT EXISTS xp_events_user_idx ON xp_events(user_id);
+
+ALTER TABLE xp_events ENABLE ROW LEVEL SECURITY;
+
+/*
+Read-only to the browser, exactly like streak_logs and habit_completions. There is no
+INSERT policy and no INSERT grant, so a forged POST fails at the table-privilege layer
+before RLS is ever consulted. Every write goes through grant_xp(), which is SECURITY
+DEFINER and reachable only from the trigger functions and the two record_* functions.
+*/
+DROP POLICY IF EXISTS "xp_events_select" ON xp_events;
+CREATE POLICY "xp_events_select" ON xp_events FOR SELECT
+  TO authenticated USING (user_id = auth.uid());
+
+REVOKE ALL ON xp_events FROM anon, authenticated;
+GRANT SELECT ON xp_events TO authenticated;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 2. grant_xp — the single insert path
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+SECURITY DEFINER, and that is load-bearing rather than habitual. The two triggers below
+fire inside an ordinary client UPDATE, so without DEFINER the insert would run as
+`authenticated` — which holds no INSERT on xp_events — and the *whole UPDATE would fail*.
+The user would be unable to complete a phase at all. So the same property that keeps the
+ledger unforgeable is what lets the trigger write to it.
+
+`ON CONFLICT DO NOTHING` with no conflict target covers BOTH unique constraints. This is
+the idempotency, expressed in one line: a second grant for a source row is not an error,
+it is a no-op. Callers do not have to know whether they are the first.
+
+No EXECUTE is granted to anybody. Its callers are all SECURITY DEFINER functions owned by
+the same role, and owners never fail their own privilege check.
+*/
+CREATE OR REPLACE FUNCTION public.grant_xp(
+  p_user_id      uuid,
+  p_source_type  text,
+  p_source_id    uuid,
+  p_amount       int
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  -- A missing owner or source is a bug in the caller, not something to record. Returning
+  -- quietly keeps a malformed grant from aborting the user's actual write.
+  IF p_user_id IS NULL OR p_source_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  INSERT INTO xp_events (user_id, source_type, source_id, amount)
+  VALUES (p_user_id, p_source_type, p_source_id, p_amount)
+  ON CONFLICT DO NOTHING;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.grant_xp(uuid, text, uuid, int) FROM PUBLIC, anon, authenticated;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 3. habits.is_physical — the 50-vs-100 split
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+An explicit boolean rather than matching on the title. A title is user-editable free text:
+renaming "Workout" to "Gym" would silently halve its payout, and "Read about workouts"
+would silently double it. A flag says what it means and survives a rename.
+
+It joins the UPDATE grant so the habit-edit UI can toggle it. `user_id` stays outside that
+grant, unchanged.
+*/
+ALTER TABLE habits ADD COLUMN IF NOT EXISTS is_physical boolean NOT NULL DEFAULT false;
+
+COMMENT ON COLUMN habits.is_physical IS
+  'Physical activity / workout. A verified proof on this habit pays 100 XP instead of 50.';
+
+GRANT UPDATE (title, icon, active, sort_order, is_physical) ON habits TO authenticated;
+
+-- The seeded starter set ships "Workout" already flagged, so a new user does not have to
+-- discover the toggle to get the behaviour the feature is named after. Everything else in
+-- the set defaults to false and is togglable in the UI.
+CREATE OR REPLACE FUNCTION public.seed_default_habits(p_user_id uuid)
+RETURNS void
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  INSERT INTO habits (user_id, title, icon, sort_order, is_physical)
+  SELECT p_user_id, d.title, d.icon, d.sort_order, d.is_physical
+  FROM (VALUES
+    ('Workout',         'Dumbbell', 0, true),
+    ('Deep work block', 'Code2',    1, false),
+    ('Read 20 pages',   'BookOpen', 2, false),
+    ('Sleep by 11pm',   'Moon',     3, false)
+  ) AS d(title, icon, sort_order, is_physical)
+  WHERE NOT EXISTS (SELECT 1 FROM habits h WHERE h.user_id = p_user_id);
+$$;
+
+REVOKE ALL ON FUNCTION public.seed_default_habits(uuid) FROM PUBLIC, anon, authenticated;
+
+/*
+One-time backfill for habits that already exist. This DOES match on the title — the one
+place in this migration that does, because there is no other way to identify the habit
+that was seeded before the column existed. It runs once, it is a starting value and not a
+rule, and it is overridable from the UI the moment you disagree with it.
+
+The one caveat: this is the only statement in the file that is not fully re-runnable. If
+you deliberately turn "Workout" back to standard in the UI and then replay this migration
+(via apply_all.sql, say), it flags it again. Everything else here is guarded.
+*/
+UPDATE habits SET is_physical = true
+ WHERE lower(trim(title)) = 'workout' AND is_physical = false;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 4. record_checkin — now grants XP for a bare streak proof
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+Dropped and recreated, not replaced: `p_grant_xp` is a new parameter and CREATE OR REPLACE
+cannot add one. Everything else — the streak rule, the FOR UPDATE row lock, the per-day
+upsert, the service_role-only EXECUTE — is byte-for-byte what 20260730120000 established.
+
+The single behavioural addition is the grant_xp() call, keyed on the `streak_logs` row's
+id. That id is stable across re-submission because the INSERT upserts on
+UNIQUE (user_id, log_date), so submitting three photos in one day updates one row, yields
+one source_id, and pays once. The per-day uniqueness the streak already had becomes the
+per-day uniqueness of the XP for free.
+
+`p_grant_xp = false` is passed by record_habit_completion only. See design note 1.
+*/
+DROP FUNCTION IF EXISTS public.record_checkin(uuid, text, date);
+
+CREATE OR REPLACE FUNCTION public.record_checkin(
+  p_user_id   uuid,
+  p_note      text    DEFAULT NULL,
+  p_log_date  date    DEFAULT NULL,
+  p_grant_xp  boolean DEFAULT true
+)
+RETURNS json
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_today   date := coalesce(p_log_date, current_date);
+  v_last    date;
+  v_streak  int;
+  v_already boolean := false;
+  v_log_id  uuid;
+BEGIN
+  IF p_user_id IS NULL THEN
+    RAISE EXCEPTION 'p_user_id is required';
+  END IF;
+
+  -- Row lock: without it two concurrent check-ins could both read streak = N.
+  SELECT last_checkin_date, current_streak
+    INTO v_last, v_streak
+    FROM users
+   WHERE id = p_user_id
+     FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'No profile row for that user';
+  END IF;
+
+  IF v_last = v_today THEN
+    v_already := true;                 -- already counted today
+  ELSIF v_last = v_today - 1 THEN
+    v_streak := v_streak + 1;          -- consecutive day
+  ELSE
+    v_streak := 1;                     -- first check-in, or the chain broke
+  END IF;
+
+  IF NOT v_already THEN
+    UPDATE users
+       SET current_streak    = v_streak,
+           last_checkin_date = v_today
+     WHERE id = p_user_id;
+  END IF;
+
+  -- One verified log per user per day; re-submission refreshes the note.
+  -- The DO UPDATE (rather than DO NOTHING) is what makes RETURNING always yield the row
+  -- id, first submission or fifth — a DO NOTHING conflict returns no row at all.
+  INSERT INTO streak_logs (user_id, log_date, verified, note)
+  VALUES (p_user_id, v_today, true, p_note)
+  ON CONFLICT (user_id, log_date) DO UPDATE
+     SET verified = true,
+         note     = coalesce(excluded.note, streak_logs.note)
+  RETURNING id INTO v_log_id;
+
+  -- 50 XP for a verified proof, once per streak_logs row (so: once per day).
+  IF p_grant_xp THEN
+    PERFORM grant_xp(p_user_id, 'proof', v_log_id, 50);
+  END IF;
+
+  RETURN json_build_object(
+    'current_streak',     v_streak,
+    'last_checkin_date',  v_today,
+    'already_checked_in', v_already
+  );
+END;
+$$;
+
+-- Re-asserted for the new signature. EXECUTE defaults to PUBLIC on a newly created
+-- function, so the REVOKE is load-bearing: without it any signed-in user could call this
+-- and hand themselves a streak — and now XP with it.
+REVOKE ALL ON FUNCTION public.record_checkin(uuid, text, date, boolean) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.record_checkin(uuid, text, date, boolean) TO service_role;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 5. record_habit_completion — 50, or 100 for a physical habit
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+Signature unchanged, so verify-proof needs no redeploy. Two changes in the body:
+
+  - `is_physical` is read in the same SELECT that already validated ownership and
+    `active`, so the grade costs no extra query and cannot be read from a habit that
+    failed validation.
+  - The record_checkin() call passes p_grant_xp := false. The completion below pays for
+    this proof; the streak row it creates must not pay again. Design note 1.
+
+The upsert returns the completion's id the same way record_checkin does, and
+UNIQUE (user_id, habit_id, log_date) means that id is stable per habit per day — so five
+photos of the same habit today pay once, and a second *different* habit today pays its
+own 50 or 100.
+*/
+CREATE OR REPLACE FUNCTION public.record_habit_completion(
+  p_user_id   uuid,
+  p_habit_id  uuid,
+  p_note      text DEFAULT NULL
+)
+RETURNS json
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_today       date := current_date;
+  v_title       text;
+  v_physical    boolean;
+  v_streak      json;
+  v_completion  uuid;
+BEGIN
+  IF p_user_id IS NULL OR p_habit_id IS NULL THEN
+    RAISE EXCEPTION 'p_user_id and p_habit_id are required';
+  END IF;
+
+  SELECT title, is_physical INTO v_title, v_physical
+    FROM habits
+   WHERE id = p_habit_id AND user_id = p_user_id AND active;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'No active habit % for that user', p_habit_id;
+  END IF;
+
+  INSERT INTO habit_completions (user_id, habit_id, log_date, verified, evaluation_text)
+  VALUES (p_user_id, p_habit_id, v_today, true, p_note)
+  ON CONFLICT (user_id, habit_id, log_date) DO UPDATE
+     SET verified        = true,
+         evaluation_text = coalesce(excluded.evaluation_text, habit_completions.evaluation_text)
+  RETURNING id INTO v_completion;
+
+  -- 100 for proof of physical activity, 50 for everything else.
+  IF v_physical THEN
+    PERFORM grant_xp(p_user_id, 'habit_physical', v_completion, 100);
+  ELSE
+    PERFORM grant_xp(p_user_id, 'proof', v_completion, 50);
+  END IF;
+
+  -- A verified habit is the day's check-in. Idempotent, so ticking more habits today
+  -- keeps the streak where it is rather than inflating it.
+  -- p_grant_xp := false — the completion above already paid for this proof.
+  -- NULL::date, explicitly typed: an untyped NULL in a positional call leaves the third
+  -- argument as `unknown` and makes overload resolution depend on there being exactly one
+  -- candidate. Casting it removes that dependency.
+  v_streak := record_checkin(p_user_id, p_note, NULL::date, false);
+
+  RETURN json_build_object(
+    'habit_id',  p_habit_id,
+    'title',     v_title,
+    'log_date',  v_today,
+    'streak',    v_streak
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.record_habit_completion(uuid, uuid, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.record_habit_completion(uuid, uuid, text) TO service_role;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 6. path_phases — 100 XP on transition into completed
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+AFTER, not BEFORE. This is the whole difference between this trigger and the
+`path_phases_no_forged_completion` trigger that 20260808120000 deliberately removed:
+
+  - That one was BEFORE and RAISEd. It decided whether your write was allowed.
+  - This one is AFTER and only ever inserts into a different table. By the time it runs
+    the status has already changed; it has no way to refuse and no code path that RAISEs.
+    Toggling a phase back to pending still works. Completing it again still works.
+
+`RETURN NULL` because the return value of an AFTER FOR EACH ROW trigger is discarded.
+
+INSERT is covered as well as UPDATE, because `authenticated` holds INSERT on path_phases
+and a phase can be born `completed` — the client legitimately creates one that way. An
+UPDATE-only trigger would silently pay nothing for those, which reads as a bug rather
+than a policy. It is not a farming route: the ledger is keyed on the phase's id.
+
+The `WHEN` clause keeps the function from being called at all for the overwhelmingly
+common case (a title edit, a reorder, a move to `live`), so the ordinary write path is
+untouched down to not even entering plpgsql.
+*/
+CREATE OR REPLACE FUNCTION public.path_phases_grant_xp()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  PERFORM grant_xp(NEW.user_id, 'phase', NEW.id, 100);
+  RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS path_phases_xp ON public.path_phases;
+CREATE TRIGGER path_phases_xp
+  AFTER INSERT OR UPDATE OF status ON public.path_phases
+  FOR EACH ROW
+  WHEN (NEW.status = 'completed')
+  EXECUTE FUNCTION public.path_phases_grant_xp();
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 7. goals — 250 XP short-term, 500 XP long-term
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+Identical shape to the phase trigger. `goals.status` was already owner-writable
+(20260731180000 grants UPDATE on it), so the checkbox on the Goals page is an ordinary
+UPDATE through a grant that already existed — this file adds nothing to it.
+
+The amount is read from NEW.goal_type rather than passed in, so retyping a goal from
+short to long *after* completing it does not re-pay: the source_id is already in the
+ledger and grant_xp() no-ops on the second call regardless of amount. First completion
+sets the price.
+*/
+CREATE OR REPLACE FUNCTION public.goals_grant_xp()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NEW.goal_type = 'long_term' THEN
+    PERFORM grant_xp(NEW.user_id, 'goal_long', NEW.id, 500);
+  ELSE
+    PERFORM grant_xp(NEW.user_id, 'goal_short', NEW.id, 250);
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS goals_xp ON public.goals;
+CREATE TRIGGER goals_xp
+  AFTER INSERT OR UPDATE OF status ON public.goals
+  FOR EACH ROW
+  WHEN (NEW.status = 'completed')
+  EXECUTE FUNCTION public.goals_grant_xp();
+
+NOTIFY pgrst, 'reload schema';
+
+
+/*
+════════════════════════════════════════════════════════════════════════════════
+VERIFY — run after applying. Nothing in this block writes except where marked,
+and those parts are wrapped in ROLLBACK.
+════════════════════════════════════════════════════════════════════════════════
+
+-- ── 1. THE GRANTS CHECK. This is the one that matters. ──────────────────────
+-- EXPECT: xp_select = true, and INSERT/UPDATE/DELETE all false for BOTH roles.
+-- If xp_insert reads true for authenticated, the ledger is forgeable from the
+-- browser console and every number in the header is a lie.
+SELECT
+  has_table_privilege('authenticated', 'public.xp_events', 'SELECT') AS xp_select_authenticated,
+  has_table_privilege('authenticated', 'public.xp_events', 'INSERT') AS xp_insert_authenticated,
+  has_table_privilege('authenticated', 'public.xp_events', 'UPDATE') AS xp_update_authenticated,
+  has_table_privilege('authenticated', 'public.xp_events', 'DELETE') AS xp_delete_authenticated,
+  has_table_privilege('anon',          'public.xp_events', 'SELECT') AS xp_select_anon,
+  has_table_privilege('anon',          'public.xp_events', 'INSERT') AS xp_insert_anon;
+
+-- EXPECT: exactly one row — authenticated / SELECT. `anon` must not appear.
+SELECT grantee, privilege_type
+FROM information_schema.table_privileges
+WHERE table_schema = 'public' AND table_name = 'xp_events'
+  AND grantee IN ('anon', 'authenticated')
+ORDER BY grantee, privilege_type;
+
+-- EXPECT: rowsecurity = true, and exactly one policy: xp_events_select, cmd SELECT,
+-- qual (user_id = auth.uid()). No INSERT policy.
+SELECT relrowsecurity AS rls_enabled FROM pg_class WHERE oid = 'public.xp_events'::regclass;
+SELECT policyname, cmd, qual FROM pg_policies
+WHERE schemaname = 'public' AND tablename = 'xp_events';
+
+-- EXPECT: both unique constraints present.
+SELECT conname, pg_get_constraintdef(oid)
+FROM pg_constraint WHERE conrelid = 'public.xp_events'::regclass AND contype = 'u'
+ORDER BY conname;
+
+-- EXPECT: grant_xp is security_definer = true and executable by NOBODY but its owner.
+SELECT p.prosecdef AS security_definer,
+       has_function_privilege('authenticated', 'public.grant_xp(uuid,text,uuid,int)', 'EXECUTE') AS grant_xp_authenticated,
+       has_function_privilege('anon',          'public.grant_xp(uuid,text,uuid,int)', 'EXECUTE') AS grant_xp_anon,
+       has_function_privilege('service_role',  'public.grant_xp(uuid,text,uuid,int)', 'EXECUTE') AS grant_xp_service_role
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public' AND p.proname = 'grant_xp';
+
+
+-- ── 2. NOTHING ELSE MOVED ───────────────────────────────────────────────────
+-- The claim in the header is that no existing permission changed. Check it.
+
+-- EXPECT: can_write_status = true (manual completion still works — the
+-- 20260808120000 decision stands), user_id/path_id false.
+SELECT
+  has_column_privilege('authenticated', 'public.path_phases', 'status',  'UPDATE') AS phase_status_writable,
+  has_column_privilege('authenticated', 'public.path_phases', 'user_id', 'UPDATE') AS phase_user_id_writable,
+  has_column_privilege('authenticated', 'public.goals',       'status',  'UPDATE') AS goal_status_writable,
+  has_column_privilege('authenticated', 'public.goals',       'user_id', 'UPDATE') AS goal_user_id_writable,
+  has_column_privilege('authenticated', 'public.habits', 'is_physical',  'UPDATE') AS habit_physical_writable,
+  has_column_privilege('authenticated', 'public.habits',      'user_id', 'UPDATE') AS habit_user_id_writable;
+-- EXPECT: true, false, true, false, true, false.
+
+-- EXPECT: for BOTH record functions — authenticated false, anon false, service_role true.
+SELECT
+  has_function_privilege('authenticated', 'public.record_checkin(uuid,text,date,boolean)', 'EXECUTE')      AS checkin_authenticated,
+  has_function_privilege('anon',          'public.record_checkin(uuid,text,date,boolean)', 'EXECUTE')      AS checkin_anon,
+  has_function_privilege('service_role',  'public.record_checkin(uuid,text,date,boolean)', 'EXECUTE')      AS checkin_service_role,
+  has_function_privilege('authenticated', 'public.record_habit_completion(uuid,uuid,text)', 'EXECUTE')     AS habit_authenticated,
+  has_function_privilege('service_role',  'public.record_habit_completion(uuid,uuid,text)', 'EXECUTE')     AS habit_service_role;
+
+-- EXPECT: NULL. The 3-arg record_checkin must be gone, or PostgREST sees two
+-- overloads and 300s on an ambiguous call from verify-proof.
+SELECT to_regprocedure('public.record_checkin(uuid,text,date)') AS old_3arg_must_be_null;
+
+-- EXPECT: streak_logs and habit_completions still grant SELECT and nothing else.
+SELECT table_name, grantee, privilege_type
+FROM information_schema.table_privileges
+WHERE table_schema = 'public'
+  AND table_name IN ('streak_logs', 'habit_completions')
+  AND grantee IN ('anon', 'authenticated')
+ORDER BY table_name, grantee, privilege_type;
+
+-- EXPECT: the two new AFTER triggers, and NOTHING resembling a BEFORE gate.
+-- tgtype bit 0 (value 1) = ROW, bit 1 (value 2) = BEFORE. Both should read AFTER.
+SELECT c.relname AS table_name, t.tgname,
+       CASE WHEN (t.tgtype & 2) = 2 THEN 'BEFORE' ELSE 'AFTER' END AS timing
+FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+WHERE NOT t.tgisinternal AND c.relname IN ('path_phases', 'goals')
+ORDER BY c.relname, t.tgname;
+
+
+-- ── 3. A BRAND-NEW USER IS LEVEL 1 WITH 0 XP ────────────────────────────────
+-- The balance query the header runs, for every user. sum() over zero rows is NULL,
+-- so the coalesce is what makes a new account read 0 and not blank.
+SELECT u.username,
+       coalesce(sum(x.amount), 0)                        AS total_xp,
+       floor(coalesce(sum(x.amount), 0) / 50) + 1        AS level,
+       coalesce(sum(x.amount), 0) % 50                   AS xp_into_level
+FROM public.users u
+LEFT JOIN public.xp_events x ON x.user_id = u.id
+GROUP BY u.username
+ORDER BY total_xp DESC;
+-- EXPECT: a user who has done nothing reads total_xp 0, level 1, xp_into_level 0.
+
+
+-- ── 4. THE TOGGLE TEST — phase XP is paid exactly once ──────────────────────
+-- Substitute a real phase id you own that is NOT already completed.
+-- Everything is rolled back, so this leaves no XP behind.
+BEGIN;
+  SELECT count(*) AS before_count FROM xp_events WHERE source_id = '<phase-uuid>';
+  -- EXPECT: 0
+
+  UPDATE path_phases SET status = 'completed' WHERE id = '<phase-uuid>';
+  SELECT count(*), sum(amount) FROM xp_events WHERE source_id = '<phase-uuid>';
+  -- EXPECT: 1, 100
+
+  UPDATE path_phases SET status = 'pending'   WHERE id = '<phase-uuid>';
+  UPDATE path_phases SET status = 'completed' WHERE id = '<phase-uuid>';
+  UPDATE path_phases SET status = 'pending'   WHERE id = '<phase-uuid>';
+  UPDATE path_phases SET status = 'completed' WHERE id = '<phase-uuid>';
+  SELECT count(*), sum(amount) FROM xp_events WHERE source_id = '<phase-uuid>';
+  -- EXPECT: still 1, still 100. Four completions, one payout.
+  -- Note the toggles themselves all SUCCEEDED — the trigger never blocks.
+ROLLBACK;
+
+-- Same for a goal. Substitute a real goal id.
+BEGIN;
+  UPDATE goals SET status = 'completed' WHERE id = '<goal-uuid>';
+  UPDATE goals SET status = 'active'    WHERE id = '<goal-uuid>';
+  UPDATE goals SET status = 'completed' WHERE id = '<goal-uuid>';
+  SELECT source_type, amount, count(*) OVER () AS rows
+  FROM xp_events WHERE source_id = '<goal-uuid>';
+  -- EXPECT: exactly 1 row. goal_short/250 or goal_long/500 matching the goal's type.
+ROLLBACK;
+*/
+
+
+-- ============================================================================
+-- 20260813140000_avatars_and_username.sql
+-- ============================================================================
+
+/*
+# Editable username, and a real avatar in a private Storage bucket
+
+Two profile fields that were specified and never built. The avatar in the header has been
+`https://i.pravatar.cc/100?img=12` from `src/data.ts` since the app was scaffolded — the
+last piece of demo data still rendering in the shell now that level comes from the XP
+ledger.
+
+## Objects created
+- COLUMN  users.avatar_path
+- GRANT   UPDATE (username, avatar_path) ON users TO authenticated
+- BUCKET  avatars (private, 2 MB cap, image mime types only)
+- POLICY  avatars_read / avatars_insert / avatars_update / avatars_delete ON storage.objects
+
+## Username needs no new write path
+`20260727120000` already granted `UPDATE (username) ON users TO authenticated`, and the
+owner-scoped RLS policy on `users` already limits that to your own row. So renaming is an
+ordinary client UPDATE through a grant that has existed since the table did — nothing here
+widens it. Two constraints already do the validating, and the UI maps both to readable
+errors rather than inventing its own rules:
+
+  - CHECK (username ~ '^[a-z0-9_]{3,20}$')  -> 23514, the same rule as the signup form
+  - UNIQUE INDEX users_username_key         -> 23505, the collision
+
+### Renaming is a display-name change, and only that
+Logins are `<username>@spartans.local` (see `lib/auth.tsx`). That address lives in
+`auth.users.email`, which this UPDATE does not touch and which nothing in the client
+touches either — so after a rename you still sign in under the name you registered with.
+
+That is the deliberate design, not a gap to close. Keeping the two in step needs a second
+write to `auth.users` plus a compensating revert when it fails, and Supabase's "Secure
+email change" makes even the success path unreliable: it returns OK while parking the new
+address in `new_email` pending a confirmation click that a `@spartans.local` address can
+never receive. One write that always means what it says beats two that sometimes silently
+half-apply.
+
+The cost is that the login and the display name drift apart, so the Settings rename field
+states it inline ("Your login stays the same — only your display name changes") rather
+than leaving it to be found at the next sign-in.
+
+## Why the bucket is PRIVATE
+A public bucket is one line shorter and is what most avatar tutorials do. It also means
+anyone who ever sees the URL keeps read access forever, to everyone's photo, signed in or
+not. The brief was "squadmates can read it", and a public bucket cannot express
+"squadmates" at all — so: private, with a SELECT policy that calls the same
+`shares_squad_with()` helper the learning-path policies use, and signed URLs minted on
+read.
+
+That choice has one cost worth stating plainly: **a signed URL expires.** So the column
+below stores the object *path*, not a URL — storing a URL would guarantee a broken image
+a week later. `lib/auth.tsx` mints a fresh signed URL each time the profile loads.
+
+The side benefit is cache-busting for free: every upload overwrites the same object path,
+and a same-path image would otherwise sit in the browser cache showing the old photo.
+Signed URLs carry a new token each time, so the URL changes even when the path does not.
+
+## Path convention: `<user_id>/avatar`
+One object per user, no extension, `upsert: true` on write. The uuid folder is what every
+policy below keys on, so ownership is a string comparison against `auth.uid()` and not a
+lookup. No extension because the content type travels in the object's metadata, and a
+changing extension would leave the old file orphaned on every format change.
+
+## If the storage policies fail to apply
+`storage.objects` is owned by `supabase_storage_admin`, not `postgres`. Applying this
+through `supabase db push` works because the migration runs as the owner-equivalent role.
+If you ever see `42501: must be owner of table objects`, run section 3 alone from the
+dashboard SQL editor — nothing else in this file needs re-running.
+*/
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 1. users.avatar_path
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+Nullable, and null is the normal state — most users will never upload one. The client
+renders an initials monogram in that case rather than a stock photo of a stranger, so
+there is no placeholder URL to store and no DEFAULT here.
+*/
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_path text;
+
+COMMENT ON COLUMN users.avatar_path IS
+  'Object path in the private `avatars` bucket, always `<user_id>/avatar`. NOT a URL — '
+  'signed URLs expire, so the client mints one per read. Null means no avatar uploaded.';
+
+/*
+Extends the existing column grant. `username` was already there; `avatar_path` joins it.
+Everything else stays outside: `squad_id`, `current_streak`, and `last_checkin_date` remain
+ungranted, so membership still goes through join_squad() and the streak still goes through
+record_checkin(). Re-asserted as a full statement so this file states the end state rather
+than leaving it four migrations back.
+*/
+REVOKE ALL ON users FROM anon, authenticated;
+GRANT SELECT ON users TO authenticated;
+GRANT INSERT ON users TO authenticated;
+GRANT UPDATE (username, avatar_path) ON users TO authenticated;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 2. The bucket
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+`public = false` is the whole security posture — see the header. The size and mime limits
+are enforced by Storage itself, so the client-side validation in SettingsPanel is a
+courtesy message and not the guard: a crafted upload of a 50 MB file, or of a .exe renamed
+to .png, is rejected by the server regardless of what the browser did or did not check.
+
+ON CONFLICT DO UPDATE rather than DO NOTHING so re-running this migration corrects a
+bucket that was created by hand with different limits, instead of silently leaving it.
+*/
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+VALUES (
+  'avatars',
+  'avatars',
+  false,
+  2097152,                                                    -- 2 MiB
+  ARRAY['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+)
+ON CONFLICT (id) DO UPDATE
+  SET public            = excluded.public,
+      file_size_limit   = excluded.file_size_limit,
+      allowed_mime_types = excluded.allowed_mime_types;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 3. Storage policies  (run this section alone from the SQL editor if it 42501s)
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+`storage.foldername(name)` splits the object path into its folder segments, so for
+`3f2b…/avatar` it returns `{3f2b…}` and `[1]` is the owner's uuid as text.
+
+Writes compare that as TEXT against `auth.uid()::text` — no cast, so no cast can fail.
+
+The read policy needs it as a uuid to pass to `shares_squad_with()`, and a cast CAN fail:
+one hand-uploaded object at a non-uuid path would raise 22P02 and break SELECT for
+everybody, not just for that row. The CASE is what prevents that. It is a CASE and not
+`x ~ '...' AND shares_squad_with(...)` because Postgres does not guarantee the evaluation
+order of AND, and may evaluate the cast first; CASE guarantees it.
+
+`shares_squad_with()` already returns true for your own id (`p_user_id = auth.uid()`), so
+this covers self-read without a second clause — including for a user who has not joined a
+squad yet.
+*/
+DROP POLICY IF EXISTS "avatars_read"   ON storage.objects;
+DROP POLICY IF EXISTS "avatars_insert" ON storage.objects;
+DROP POLICY IF EXISTS "avatars_update" ON storage.objects;
+DROP POLICY IF EXISTS "avatars_delete" ON storage.objects;
+
+-- Squadmates (and you) may read.
+CREATE POLICY "avatars_read" ON storage.objects FOR SELECT
+  TO authenticated
+  USING (
+    bucket_id = 'avatars'
+    AND CASE
+          WHEN (storage.foldername(name))[1] ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            THEN public.shares_squad_with(((storage.foldername(name))[1])::uuid)
+          ELSE false
+        END
+  );
+
+-- Only you may write into your own folder. This is also what guarantees every object in
+-- the bucket has a uuid folder, which is what the read policy's CASE relies on.
+CREATE POLICY "avatars_insert" ON storage.objects FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    bucket_id = 'avatars'
+    AND (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+-- Replacing an avatar is an UPDATE on the same path (upsert). USING picks which rows you
+-- may touch; WITH CHECK stops you moving one into someone else's folder on the way out.
+CREATE POLICY "avatars_update" ON storage.objects FOR UPDATE
+  TO authenticated
+  USING (
+    bucket_id = 'avatars'
+    AND (storage.foldername(name))[1] = auth.uid()::text
+  )
+  WITH CHECK (
+    bucket_id = 'avatars'
+    AND (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+CREATE POLICY "avatars_delete" ON storage.objects FOR DELETE
+  TO authenticated
+  USING (
+    bucket_id = 'avatars'
+    AND (storage.foldername(name))[1] = auth.uid()::text
+  );
+
+NOTIFY pgrst, 'reload schema';
+
+
+/*
+════════════════════════════════════════════════════════════════════════════════
+VERIFY — run after applying. Nothing here writes.
+════════════════════════════════════════════════════════════════════════════════
+
+-- 1. The column and its grant.
+--    EXPECT: username true, avatar_path true, squad_id false, current_streak false.
+--    The last two are the check that matters: this migration re-issued the grant on
+--    `users`, and getting that wrong would hand the client its own streak counter.
+SELECT
+  has_column_privilege('authenticated', 'public.users', 'username',          'UPDATE') AS username_writable,
+  has_column_privilege('authenticated', 'public.users', 'avatar_path',       'UPDATE') AS avatar_writable,
+  has_column_privilege('authenticated', 'public.users', 'squad_id',          'UPDATE') AS squad_writable,
+  has_column_privilege('authenticated', 'public.users', 'current_streak',    'UPDATE') AS streak_writable,
+  has_column_privilege('authenticated', 'public.users', 'last_checkin_date', 'UPDATE') AS checkin_writable;
+-- EXPECT: true, true, false, false, false.
+
+-- 2. The bucket is private and capped.
+--    EXPECT: public = false, file_size_limit = 2097152, four image mime types.
+SELECT id, public, file_size_limit, allowed_mime_types
+FROM storage.buckets WHERE id = 'avatars';
+
+-- 3. Four policies, and the read one is the only one that is not owner-only.
+SELECT policyname, cmd, qual, with_check
+FROM pg_policies
+WHERE schemaname = 'storage' AND tablename = 'objects' AND policyname LIKE 'avatars%'
+ORDER BY policyname;
+
+-- 4. The rename constraints the UI maps its error messages to still exist.
+--    EXPECT: one CHECK matching the username regex, one UNIQUE index on username.
+SELECT conname, pg_get_constraintdef(oid)
+FROM pg_constraint WHERE conrelid = 'public.users'::regclass AND contype = 'c';
+SELECT indexname, indexdef FROM pg_indexes
+WHERE schemaname = 'public' AND tablename = 'users' AND indexname = 'users_username_key';
+
+-- 5. THE XP LEDGER IS UNTOUCHED. This migration re-issued grants on `users`, which is a
+--    table the XP work reads through record_checkin(). Cheap to check, expensive to be
+--    wrong about.
+--    EXPECT: xp SELECT true, xp INSERT false, checkin authenticated false / service_role true.
+SELECT
+  has_table_privilege('authenticated', 'public.xp_events', 'SELECT') AS xp_select,
+  has_table_privilege('authenticated', 'public.xp_events', 'INSERT') AS xp_insert,
+  has_function_privilege('authenticated', 'public.record_checkin(uuid,text,date,boolean)', 'EXECUTE') AS checkin_authenticated,
+  has_function_privilege('service_role',  'public.record_checkin(uuid,text,date,boolean)', 'EXECUTE') AS checkin_service_role;
+
+
+-- 6. Rename forgery, from the SQL editor. Substitute two real user ids.
+--    The grant is column-level, so this is about RLS: can you rename SOMEONE ELSE?
+--    Run as the anon/authenticated role via the REST probes in verify_avatar_forgery.sh
+--    rather than here — as `postgres` you bypass RLS and this proves nothing.
+*/
+
+
+-- ============================================================================
+-- 20260813150000_xp_live_mirror.sql
+-- ============================================================================
+
+/*
+# XP for phases and goals becomes a live mirror of current state
+
+Until now a completion was a permanent event: 20260813130000 made `xp_events` an append-only
+ledger, and the whole idempotency story was "one source row can only ever pay once". Ticking a
+phase paid 100 forever, un-ticking it kept the 100, and deleting the phase kept it too.
+
+This migration changes what phase/goal XP *means*. It is no longer a record of "you once
+completed this"; it is a projection of "this is currently completed". The ledger stops being
+append-only for these two source types and starts tracking state:
+
+  complete   -> +100 / +250 / +500   (unchanged, same triggers, same amounts)
+  un-complete -> the matching row is deleted
+  delete row  -> the matching row is deleted
+
+So the sum of a user's phase/goal XP is always exactly the XP of what is marked complete
+right now. Toggle a phase a hundred times and land on `pending`: the ledger reads the same as
+if you had never touched it.
+
+## What this does NOT touch, and how that is enforced rather than promised
+
+`record_checkin()` and `record_habit_completion()` — the streak and habit proof paths — are
+not in this file. Not dropped, not replaced, not re-granted. Their XP stays permanent, because
+a photo you took on a Tuesday is a fact about that Tuesday; there is no "un-take" of it, and
+nothing about a habit's later state can make it un-happen. Phases and goals are different in
+kind: `status` is a mutable field describing the present, and it now reads as one.
+
+That separation is enforced structurally, not by care. `revoke_xp()` below carries a hardcoded
+whitelist — it can only ever delete `phase`, `goal_short`, `goal_long`. A caller that passes
+'proof' or 'habit_physical' deletes nothing, today and after any future edit to the triggers.
+The only way to make proof XP revocable is to edit that ARRAY, which is a visible, deliberate
+act and not an accident.
+
+## This closes the delete-and-recreate faucet
+
+20260813130000's design note 3 flagged a known residual: delete a completed goal, create a new
+one, get paid again — new uuid, new payout, and no constraint on the ledger could see it,
+because the new row genuinely is a different thing. Note 3 said closing it needed a rate cap.
+
+It did not. Under a live mirror, deleting a completed goal takes its XP with it, so the
+delete-and-recreate cycle nets to what you would have had by completing one goal once. The
+residual is closed here as a natural consequence of the model change rather than by a cap that
+would have had to guess at a fair daily number.
+
+## Objects created / changed
+- FUNCTION revoke_xp(uuid, uuid, text[])                  — NEW, the single delete path
+- FUNCTION path_phases_revoke_xp()  + 2 TRIGGERS on path_phases   — NEW
+- FUNCTION goals_revoke_xp()        + 2 TRIGGERS on goals         — NEW
+- Nothing else. No table is altered, no GRANT/REVOKE/POLICY moves, no existing function body
+  is edited. The two grant triggers from 20260813130000 keep firing exactly as they do today.
+*/
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 1. revoke_xp — the single delete path, and the wall around proof XP
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+The mirror image of grant_xp(), with the same two properties for the same two reasons:
+
+  - SECURITY DEFINER, because the triggers fire inside an ordinary client UPDATE/DELETE
+    running as `authenticated`, which holds no DELETE on xp_events. Without DEFINER the
+    delete would fail and take the user's write down with it — they would be unable to
+    un-tick a phase at all.
+  - EXECUTE granted to nobody. Its only callers are trigger functions owned by the same
+    role, and owners never fail their own privilege check. A direct call from PostgREST
+    404s exactly as grant_xp() does.
+
+Deleting zero rows is a success, not an error. Un-completing a phase that never paid (it was
+completed before this migration and... no, it paid; but: completed, refunded, un-completed
+again) must not abort the user's UPDATE. DELETE is naturally idempotent, so this needs no
+ON CONFLICT equivalent — running it twice is the same as running it once.
+
+The `p_source_types` parameter narrows to what the *caller* owns (phases pass ARRAY['phase']),
+and the second predicate narrows to what this function will *ever* touch. Both are needed:
+the first stops the goals trigger from reaching a phase's row, the second stops any of them
+from reaching a proof row. `user_id` is in the predicate as well — it is outside the client's
+UPDATE grant on both tables, so it is a stable identity, and scoping to it means even a forged
+`source_id` collision could not delete another user's grant.
+*/
+CREATE OR REPLACE FUNCTION public.revoke_xp(
+  p_user_id       uuid,
+  p_source_id     uuid,
+  p_source_types  text[]
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF p_user_id IS NULL OR p_source_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  DELETE FROM xp_events
+   WHERE source_id   = p_source_id
+     AND user_id     = p_user_id
+     AND source_type = ANY (p_source_types)
+     -- The wall. Streak and habit proof XP is permanent, and this is where that is true:
+     -- 'proof' and 'habit_physical' are not in this list and cannot be passed into it.
+     AND source_type = ANY (ARRAY['phase', 'goal_short', 'goal_long']);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.revoke_xp(uuid, uuid, text[]) FROM PUBLIC, anon, authenticated;
+
+COMMENT ON FUNCTION public.revoke_xp(uuid, uuid, text[]) IS
+  'Deletes the xp_events row for a phase/goal that is no longer completed. Cannot reach '
+  'proof or habit_physical grants — those are permanent by construction.';
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 2. path_phases — revoke on leaving completed, and on delete
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+One function, two triggers. OLD is populated for both UPDATE and DELETE, and neither `id` nor
+`user_id` is in the client's UPDATE grant on path_phases (20260805120000 grants UPDATE only on
+title, description, status, start_date, target_date, order_index), so OLD is the correct row
+identity in both cases and cannot have been steered.
+
+AFTER, like the grant triggers, and for the same reason: this reacts to a write that has
+already been allowed. There is no code path here that can RAISE, so no un-tick and no delete
+can be blocked by XP bookkeeping.
+*/
+CREATE OR REPLACE FUNCTION public.path_phases_revoke_xp()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  PERFORM revoke_xp(OLD.user_id, OLD.id, ARRAY['phase']);
+  RETURN NULL;
+END;
+$$;
+
+/*
+`IS DISTINCT FROM` rather than `<>`: status is NOT NULL today, so the two are equivalent, but
+`<>` against a NULL yields NULL, a WHEN clause treats NULL as false, and the revoke would
+silently not fire. IS DISTINCT FROM is the form that stays correct if the column ever loosens.
+
+Note this fires on completed -> paused and completed -> archived as much as completed ->
+active. Any exit from completed is an exit; the ledger mirrors `status = 'completed'`, not
+"has ever been completed".
+*/
+DROP TRIGGER IF EXISTS path_phases_xp_revoke ON public.path_phases;
+CREATE TRIGGER path_phases_xp_revoke
+  AFTER UPDATE OF status ON public.path_phases
+  FOR EACH ROW
+  WHEN (OLD.status = 'completed' AND NEW.status IS DISTINCT FROM 'completed')
+  EXECUTE FUNCTION public.path_phases_revoke_xp();
+
+/*
+The delete arm. The WHEN clause means a phase deleted while pending costs one trigger
+evaluation and no query at all — and the DELETE inside is keyed on the ledger's UNIQUE
+source_id, so even without the guard it would be a single index probe.
+
+This fires on cascade deletes too: `path_phases.path_id` references learning_paths ON DELETE
+CASCADE, and a cascade fires row triggers on the child table. Deleting a whole learning path
+therefore refunds every completed phase under it, which is the behaviour the mirror requires —
+the phases are gone, so their XP must be.
+*/
+DROP TRIGGER IF EXISTS path_phases_xp_revoke_delete ON public.path_phases;
+CREATE TRIGGER path_phases_xp_revoke_delete
+  AFTER DELETE ON public.path_phases
+  FOR EACH ROW
+  WHEN (OLD.status = 'completed')
+  EXECUTE FUNCTION public.path_phases_revoke_xp();
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 3. goals — same two triggers, both goal grades
+-- ═══════════════════════════════════════════════════════════════════════════
+/*
+Both source types are passed, not the one matching the goal's current `goal_type`, and that is
+deliberate. goals_grant_xp() reads the type at completion time and the first completion sets
+the price (20260813130000 §7); retyping a completed goal from short to long does not re-price
+it, so the ledger row may legitimately be `goal_short` while the row now says `long_term`.
+Passing both means the revoke finds the grant whichever grade it was written at. Passing the
+current type would strand a row and leak 250 XP on exactly that path.
+*/
+CREATE OR REPLACE FUNCTION public.goals_revoke_xp()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  PERFORM revoke_xp(OLD.user_id, OLD.id, ARRAY['goal_short', 'goal_long']);
+  RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS goals_xp_revoke ON public.goals;
+CREATE TRIGGER goals_xp_revoke
+  AFTER UPDATE OF status ON public.goals
+  FOR EACH ROW
+  WHEN (OLD.status = 'completed' AND NEW.status IS DISTINCT FROM 'completed')
+  EXECUTE FUNCTION public.goals_revoke_xp();
+
+DROP TRIGGER IF EXISTS goals_xp_revoke_delete ON public.goals;
+CREATE TRIGGER goals_xp_revoke_delete
+  AFTER DELETE ON public.goals
+  FOR EACH ROW
+  WHEN (OLD.status = 'completed')
+  EXECUTE FUNCTION public.goals_revoke_xp();
+
+NOTIFY pgrst, 'reload schema';
+
+
+/*
+════════════════════════════════════════════════════════════════════════════════
+VERIFY — run after applying. Read-only except where marked; the write tests are
+wrapped in ROLLBACK and leave nothing behind.
+════════════════════════════════════════════════════════════════════════════════
+
+-- ── 1. THE PROOF-XP WALL. This is the one that matters most in this file. ───
+-- EXPECT: the ARRAY in the function body lists exactly phase, goal_short, goal_long.
+-- If 'proof' or 'habit_physical' ever appears here, streak and habit XP became
+-- revocable and every "your streak XP is permanent" claim in this repo is false.
+SELECT prosrc LIKE '%ARRAY[''phase'', ''goal_short'', ''goal_long'']%' AS wall_intact,
+       prosrc LIKE '%proof%'          AS mentions_proof_MUST_BE_FALSE,
+       prosrc LIKE '%habit_physical%' AS mentions_habit_MUST_BE_FALSE
+FROM pg_proc WHERE proname = 'revoke_xp';
+
+-- EXPECT: revoke_xp is SECURITY DEFINER and executable by NOBODY but its owner.
+SELECT p.prosecdef AS security_definer,
+       has_function_privilege('authenticated', 'public.revoke_xp(uuid,uuid,text[])', 'EXECUTE') AS revoke_authenticated,
+       has_function_privilege('anon',          'public.revoke_xp(uuid,uuid,text[])', 'EXECUTE') AS revoke_anon,
+       has_function_privilege('service_role',  'public.revoke_xp(uuid,uuid,text[])', 'EXECUTE') AS revoke_service_role
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public' AND p.proname = 'revoke_xp';
+-- EXPECT: true, false, false, false.
+
+-- ── 2. THE STREAK/HABIT PATHS DID NOT MOVE ─────────────────────────────────
+-- The claim in the header is that this file does not touch proof XP. Check the
+-- functions themselves, not the description.
+-- EXPECT: both still call grant_xp, neither mentions revoke_xp, both still
+-- service_role-only.
+SELECT proname,
+       prosrc LIKE '%grant_xp%'  AS still_grants,
+       prosrc LIKE '%revoke_xp%' AS calls_revoke_MUST_BE_FALSE,
+       has_function_privilege('authenticated', p.oid, 'EXECUTE') AS authenticated_MUST_BE_FALSE,
+       has_function_privilege('service_role',  p.oid, 'EXECUTE') AS service_role_MUST_BE_TRUE
+FROM pg_proc p
+WHERE proname IN ('record_checkin', 'record_habit_completion')
+ORDER BY proname;
+
+-- EXPECT: zero rows. No trigger anywhere fires revoke on the proof tables.
+SELECT c.relname, t.tgname
+FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+WHERE NOT t.tgisinternal
+  AND c.relname IN ('streak_logs', 'habit_completions')
+  AND pg_get_triggerdef(t.oid) ILIKE '%revoke%';
+
+-- ── 3. TRIGGER INVENTORY ───────────────────────────────────────────────────
+-- EXPECT: 3 triggers per table — the original grant (INSERT OR UPDATE), the
+-- update-revoke, the delete-revoke. ALL of them AFTER. A BEFORE here would mean
+-- XP bookkeeping can veto a user's write.
+SELECT c.relname AS table_name, t.tgname,
+       CASE WHEN (t.tgtype & 2) = 2 THEN 'BEFORE' ELSE 'AFTER' END AS timing,
+       CASE WHEN (t.tgtype &  4) =  4 THEN 'INSERT ' ELSE '' END ||
+       CASE WHEN (t.tgtype &  8) =  8 THEN 'DELETE ' ELSE '' END ||
+       CASE WHEN (t.tgtype & 16) = 16 THEN 'UPDATE ' ELSE '' END AS events
+FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+WHERE NOT t.tgisinternal AND c.relname IN ('path_phases', 'goals')
+ORDER BY c.relname, t.tgname;
+
+-- ── 4. NO PERMISSION MOVED ─────────────────────────────────────────────────
+-- EXPECT: identical to what 20260813130000 asserted — status writable, user_id not.
+SELECT
+  has_column_privilege('authenticated', 'public.path_phases', 'status',  'UPDATE') AS phase_status_writable,
+  has_column_privilege('authenticated', 'public.path_phases', 'user_id', 'UPDATE') AS phase_user_id_writable,
+  has_column_privilege('authenticated', 'public.goals',       'status',  'UPDATE') AS goal_status_writable,
+  has_column_privilege('authenticated', 'public.goals',       'user_id', 'UPDATE') AS goal_user_id_writable;
+-- EXPECT: true, false, true, false.
+
+-- EXPECT: still exactly one row — authenticated / SELECT. The browser gained no
+-- ability to write the ledger; the revoke happens under DEFINER, not under it.
+SELECT grantee, privilege_type
+FROM information_schema.table_privileges
+WHERE table_schema = 'public' AND table_name = 'xp_events'
+  AND grantee IN ('anon', 'authenticated')
+ORDER BY grantee, privilege_type;
+
+-- ── 5. THE CYCLE, IN SQL. Substitute a phase id you own. ───────────────────
+BEGIN;
+  SELECT coalesce(sum(amount), 0) AS baseline FROM xp_events WHERE user_id = auth.uid();
+
+  UPDATE path_phases SET status = 'completed' WHERE id = '<phase-uuid>';
+  SELECT count(*) AS rows_MUST_BE_1, coalesce(sum(amount),0) AS amount_MUST_BE_100
+  FROM xp_events WHERE source_id = '<phase-uuid>';
+
+  UPDATE path_phases SET status = 'pending' WHERE id = '<phase-uuid>';
+  SELECT count(*) AS rows_MUST_BE_0 FROM xp_events WHERE source_id = '<phase-uuid>';
+
+  UPDATE path_phases SET status = 'completed' WHERE id = '<phase-uuid>';
+  UPDATE path_phases SET status = 'pending'   WHERE id = '<phase-uuid>';
+  UPDATE path_phases SET status = 'completed' WHERE id = '<phase-uuid>';
+  SELECT count(*) AS rows_MUST_BE_1, coalesce(sum(amount),0) AS amount_MUST_BE_100
+  FROM xp_events WHERE source_id = '<phase-uuid>';
+  -- Three completions, one row. No accumulation.
+
+  DELETE FROM path_phases WHERE id = '<phase-uuid>';
+  SELECT count(*) AS rows_MUST_BE_0 FROM xp_events WHERE source_id = '<phase-uuid>';
+  -- The delete-and-recreate faucet, closed.
+ROLLBACK;
+
+-- ── 6. PROOF XP SURVIVES A GOAL CYCLE ──────────────────────────────────────
+-- The negative control for section 1: churn a goal and confirm the proof rows
+-- sitting next to it in the same table do not move.
+BEGIN;
+  SELECT coalesce(sum(amount),0) AS proof_xp_before
+  FROM xp_events WHERE user_id = auth.uid() AND source_type IN ('proof','habit_physical');
+
+  UPDATE goals SET status = 'completed' WHERE id = '<goal-uuid>';
+  UPDATE goals SET status = 'active'    WHERE id = '<goal-uuid>';
+  DELETE FROM goals WHERE id = '<goal-uuid>';
+
+  SELECT coalesce(sum(amount),0) AS proof_xp_after
+  FROM xp_events WHERE user_id = auth.uid() AND source_type IN ('proof','habit_physical');
+  -- EXPECT: proof_xp_after = proof_xp_before, exactly.
+ROLLBACK;
 */
 

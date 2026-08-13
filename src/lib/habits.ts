@@ -19,6 +19,15 @@ export interface Habit {
   icon: string;
   active: boolean;
   sort_order: number;
+  /**
+   * Physical activity / workout. A verified proof on this habit is worth 100 XP instead
+   * of the standard 50 — read server-side by record_habit_completion(), never here, so
+   * the client cannot influence the amount by lying about the flag.
+   *
+   * An explicit column rather than matching the title: renaming "Workout" to "Gym" must
+   * not silently halve what it pays.
+   */
+  is_physical: boolean;
 }
 
 /** A habit joined with whether it has a verified completion today. */
@@ -57,7 +66,7 @@ export async function loadHabits(): Promise<Result<HabitToday[]>> {
   const [habitsRes, compRes] = await Promise.all([
     supabase
       .from('habits')
-      .select('id, title, icon, active, sort_order')
+      .select('id, title, icon, active, sort_order, is_physical')
       .eq('active', true)
       .order('sort_order', { ascending: true })
       .order('created_at', { ascending: true }),
@@ -93,7 +102,7 @@ export async function createHabit(input: {
   const { data, error } = await supabase
     .from('habits')
     .insert({ title: input.title.trim(), icon: input.icon || 'Flame' })
-    .select('id, title, icon, active, sort_order')
+    .select('id, title, icon, active, sort_order, is_physical')
     .single();
 
   return { data: (data as Habit) ?? null, error: error?.message ?? null };
@@ -104,7 +113,7 @@ export async function createHabit(input: {
 export async function loadAllHabits(): Promise<Result<Habit[]>> {
   const { data, error } = await supabase
     .from('habits')
-    .select('id, title, icon, active, sort_order')
+    .select('id, title, icon, active, sort_order, is_physical')
     .order('active', { ascending: false })
     .order('sort_order', { ascending: true })
     .order('created_at', { ascending: true });
@@ -114,13 +123,14 @@ export async function loadAllHabits(): Promise<Result<Habit[]>> {
 
 export async function updateHabit(
   id: string,
-  patch: { title?: string; icon?: string; active?: boolean; sort_order?: number },
+  patch: { title?: string; icon?: string; active?: boolean; sort_order?: number; is_physical?: boolean },
 ): Promise<Result<null>> {
   const clean: typeof patch = {};
   if (patch.title !== undefined) clean.title = patch.title.trim();
   if (patch.icon !== undefined) clean.icon = patch.icon;
   if (patch.active !== undefined) clean.active = patch.active;
   if (patch.sort_order !== undefined) clean.sort_order = patch.sort_order;
+  if (patch.is_physical !== undefined) clean.is_physical = patch.is_physical;
 
   const { error } = await supabase.from('habits').update(clean).eq('id', id);
   return { data: null, error: error?.message ?? null };

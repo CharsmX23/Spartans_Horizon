@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
-import { Plus, X, Target, CheckCircle, Clock, Pause, Trash2 } from 'lucide-react';
+import { Plus, X, Target, CheckCircle, Clock, Pause, Trash2, Check } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { Goal, GoalType, GOAL_TYPE_COLOR } from '../lib/goals';
+import { bumpXp } from '../lib/xp';
 
 function daysUntil(isoDate: string | null): number | null {
   if (!isoDate) return null;
@@ -28,6 +29,7 @@ const STATUS_CYCLE: Record<Goal['status'], Goal['status']> = {
 
 export default function GoalsPage() {
   const [goals, setGoals] = useState<Goal[]>([]);
+  const [pending, setPending] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
   const [modalType, setModalType] = useState<GoalType>('long_term');
@@ -81,16 +83,67 @@ export default function GoalsPage() {
   }
 
   async function cycleStatus(goal: Goal) {
-    const next = STATUS_CYCLE[goal.status];
-    const { error: updateError } = await supabase.from('goals').update({ status: next }).eq('id', goal.id);
-    if (updateError) { setError(updateError.message); return; }
+    await writeStatus(goal, STATUS_CYCLE[goal.status]);
+  }
+
+  /**
+   * The completion checkbox. Ticking it is `status = 'completed'` through the UPDATE
+   * grant `goals` already had — the 250/500 XP is granted by the `goals_xp` AFTER trigger
+   * reacting to that transition, not by anything this function asks for.
+   *
+   * Untickable on purpose: unticking sets the goal back to 'active' and does NOT refund.
+   * `xp_events` is keyed on the goal's id, so re-ticking pays nothing the second time.
+   * The checkbox is therefore free to toggle and the ledger stays honest.
+   */
+  async function setCompleted(goal: Goal, completed: boolean) {
+    await writeStatus(goal, completed ? 'completed' : 'active');
+  }
+
+  /**
+   * Optimistic, then reconciled against the row the database actually returns.
+   *
+   * The optimistic hop is what makes the tick feel instant; `.select().single()` on the
+   * same request is what stops it being a lie. If the write is rejected — an expired
+   * session, a revoked grant — the checkbox snaps back and the error surfaces, rather
+   * than showing a completed goal that no longer exists anywhere but this tab.
+   */
+  async function writeStatus(goal: Goal, next: Goal['status']) {
+    if (next === goal.status) return;
+    const previous = goal.status;
+
+    setPending(prev => new Set(prev).add(goal.id));
     setGoals(prev => prev.map(g => g.id === goal.id ? { ...g, status: next } : g));
+
+    const { data, error: updateError } = await supabase
+      .from('goals')
+      .update({ status: next })
+      .eq('id', goal.id)
+      .select('*')
+      .single();
+
+    setPending(prev => { const copy = new Set(prev); copy.delete(goal.id); return copy; });
+
+    if (updateError || !data) {
+      setGoals(prev => prev.map(g => g.id === goal.id ? { ...g, status: previous } : g));
+      setError(updateError?.message ?? 'That goal could not be updated.');
+      return;
+    }
+
+    setGoals(prev => prev.map(g => g.id === goal.id ? (data as Goal) : g));
+    // The trigger has already run inside that UPDATE; refetch the header's total. Since
+    // 20260813150000 this fires in both directions — completing pays, un-completing takes
+    // it back — so the refetch matters on every status write, not just on completion.
+    bumpXp();
   }
 
   async function deleteGoal(id: string) {
     const { error: deleteError } = await supabase.from('goals').delete().eq('id', id);
     if (deleteError) { setError(deleteError.message); return; }
     setGoals(prev => prev.filter(g => g.id !== id));
+    // Deleting a *completed* goal revokes its XP (goals_xp_revoke_delete). The client has
+    // no way to tell from here whether it did — the DELETE returns nothing either way —
+    // so the header refetches unconditionally rather than guessing from local state.
+    bumpXp();
   }
 
   const longGoals = goals.filter(g => g.goal_type === 'long_term');
@@ -116,7 +169,9 @@ export default function GoalsPage() {
             goals={longGoals}
             onAdd={() => openModal('long_term')}
             onCycle={cycleStatus}
+            onSetCompleted={setCompleted}
             onDelete={deleteGoal}
+            pending={pending}
           />
           <GoalColumn
             title="Short-Term Goals"
@@ -125,7 +180,9 @@ export default function GoalsPage() {
             goals={shortGoals}
             onAdd={() => openModal('short_term')}
             onCycle={cycleStatus}
+            onSetCompleted={setCompleted}
             onDelete={deleteGoal}
+            pending={pending}
           />
         </div>
       )}
@@ -204,12 +261,14 @@ export default function GoalsPage() {
   );
 }
 
-function GoalColumn({ title, subtitle, accent, goals, onAdd, onCycle, onDelete }: {
+function GoalColumn({ title, subtitle, accent, goals, onAdd, onCycle, onSetCompleted, onDelete, pending }: {
   title: string; subtitle: string; accent: string;
   goals: Goal[];
   onAdd: () => void;
   onCycle: (g: Goal) => void;
+  onSetCompleted: (g: Goal, completed: boolean) => void;
   onDelete: (id: string) => void;
+  pending: Set<string>;
 }) {
   return (
     <div className="flex flex-col gap-3">
@@ -268,9 +327,17 @@ function GoalColumn({ title, subtitle, accent, goals, onAdd, onCycle, onDelete }
                     {goal.title}
                   </span>
                 </button>
-                <button onClick={() => onDelete(goal.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.25)', flexShrink: 0 }}>
-                  <Trash2 className="w-3.5 h-3.5 hover:text-red-400" />
-                </button>
+                <div className="flex items-center gap-2 shrink-0">
+                  <CompleteCheckbox
+                    checked={goal.status === 'completed'}
+                    busy={pending.has(goal.id)}
+                    label={goal.title}
+                    onChange={(next) => onSetCompleted(goal, next)}
+                  />
+                  <button onClick={() => onDelete(goal.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.25)', flexShrink: 0 }}>
+                    <Trash2 className="w-3.5 h-3.5 hover:text-red-400" />
+                  </button>
+                </div>
               </div>
 
               {goal.description && (
@@ -298,6 +365,51 @@ function GoalColumn({ title, subtitle, accent, goals, onAdd, onCycle, onDelete }
         })}
       </div>
     </div>
+  );
+}
+
+/**
+ * The completion checkbox. A real `<input type="checkbox">` underneath — visually hidden
+ * rather than replaced by a div — so it keeps keyboard focus, the space bar, and the
+ * checked state screen readers announce. The square is styling on top of it, not a
+ * substitute for it.
+ *
+ * `busy` dims it while the write is in flight but deliberately does NOT disable it: the
+ * optimistic state is already showing the new value, and disabling would make a
+ * double-click during a slow request feel broken.
+ */
+function CompleteCheckbox({ checked, busy, label, onChange }: {
+  checked: boolean;
+  busy: boolean;
+  label: string;
+  onChange: (next: boolean) => void;
+}) {
+  return (
+    <label
+      title={checked ? 'Mark as active again' : 'Mark complete'}
+      style={{ display: 'inline-flex', cursor: 'pointer', opacity: busy ? 0.55 : 1, transition: 'opacity .15s' }}
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        aria-label={`Mark "${label}" complete`}
+        onChange={(e) => onChange(e.target.checked)}
+        style={{ position: 'absolute', opacity: 0, width: 0, height: 0 }}
+      />
+      <span
+        aria-hidden
+        style={{
+          width: 18, height: 18, borderRadius: 6, display: 'grid', placeItems: 'center',
+          background: checked ? '#34D39926' : 'rgba(255,255,255,0.04)',
+          border: `1px solid ${checked ? '#34D39988' : 'rgba(255,255,255,0.18)'}`,
+          boxShadow: checked ? '0 0 12px -3px #34D399' : 'none',
+          color: '#34D399',
+          transition: 'background .15s, border-color .15s, box-shadow .15s',
+        }}
+      >
+        {checked && <Check className="w-3 h-3" strokeWidth={3} />}
+      </span>
+    </label>
   );
 }
 

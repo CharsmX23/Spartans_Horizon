@@ -3,6 +3,7 @@ import { Flame, Upload, CheckCircle, XCircle, Zap, Pencil, EyeOff, Check, Slider
 import { supabase } from '../lib/supabase';
 import { verifyProof, validateProofFile } from '../lib/proof';
 import { loadHabits, verifyHabit, habitIcon, updateHabit, setHabitActive, HabitToday } from '../lib/habits';
+import { bumpXp } from '../lib/xp';
 import HabitManager from './HabitManager';
 import CameraCapture from './CameraCapture';
 import { useAuth } from '../lib/auth';
@@ -181,6 +182,10 @@ export default function StreaksPage({ user }: Props) {
     // what is actually in the database.
     setMessage(result.verdict.evaluation_text);
     setUploadState('verified');
+    // A passing verdict granted XP server-side — 50, or 100 if the habit is flagged
+    // physical. Same reason for refetching rather than adding it here: the amount is the
+    // database's to decide.
+    bumpXp();
     await Promise.all([loadLogs(), refreshHabits(), refreshProfile()]);
   }
 

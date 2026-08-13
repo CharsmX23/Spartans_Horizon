@@ -25,6 +25,8 @@ Two Supabase dashboard settings are load-bearing and not expressible in migratio
 - **Auth → disable "Confirm email".** Logins use synthetic `@spartans.local` addresses that can never receive mail, so with confirmation on, `signUp` returns no session and the account is permanently unverifiable.
 - Password minimum stays at 6 to match the `minLength` on the signup form.
 
+**Renaming is a display-name change only.** `updateUsername()` writes `public.users.username` and nothing else; `auth.users.email` keeps the `<username>@spartans.local` address fixed at signup, so you always sign in under the name you registered with. The two identities drift apart by design — the Settings rename field says so inline. Do not "fix" this by adding an `auth.updateUser({ email })` call: that path was built and removed, because "Secure email change" returns success while parking the address in `new_email` awaiting a confirmation click that can never arrive.
+
 ## Architecture
 
 Vite + React 18 + TypeScript SPA ("Event Horizon / Spartan" personal dashboard), originally scaffolded in Bolt.new. Supabase provides both auth and the entire backend; there is no server code of our own.

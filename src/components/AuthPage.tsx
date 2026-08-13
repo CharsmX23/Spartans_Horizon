@@ -2,6 +2,8 @@ import { useState, FormEvent } from 'react';
 import { AtSign, Lock, LogIn, UserPlus, Loader2, ShieldCheck } from 'lucide-react';
 import { useAuth } from '../lib/auth';
 import CursorGlow from './CursorGlow';
+import CursorReveal from './CursorReveal';
+import { getCurrentUser } from '../data';
 
 type Mode = 'signin' | 'signup';
 
@@ -32,10 +34,20 @@ export default function AuthPage() {
   }
 
   return (
-    // `isolate` gives the cursor glow's z-index:-1 a stacking context to sit in — above
-    // this div's background, below the form.
+    // `isolate` makes this the stacking context the two z-index:-1 cursor layers sit in:
+    // above this div's background, below the form. Same arrangement as AppShell's root.
     <div className="min-h-screen flex items-center justify-center px-4 py-10 relative overflow-hidden bg-ink isolate">
       <CursorGlow />
+
+      {/* The icon field the glow uncovers. CursorGlow on its own is a 240px radial
+          gradient at ~45% alpha screen-blended over #050507 — it is the *light*, not the
+          effect, and with nothing to light it reads as if the glow were missing entirely.
+          AppShell has always mounted both; this screen was mounting only the glow.
+
+          `accent` is the same default AppShell seeds its own accent state with, so the
+          login screen and the first authenticated frame agree on the theme rather than
+          switching glyph set the moment you sign in. */}
+      <CursorReveal accent={getCurrentUser().accent} />
 
       {/* Ambient glow */}
       <div

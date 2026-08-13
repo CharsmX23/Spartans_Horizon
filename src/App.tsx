@@ -37,8 +37,11 @@ function AppShell() {
     applyAccent(ACCENTS[accent].hex);
   }, [accent]);
 
-  // Identity comes from the profile row; level/avatar are still demo data from
-  // data.ts until those features land.
+  // Identity comes from the profile row. `demo.level` and `demo.avatar` are both still in
+  // data.ts and are both now read by nothing in the shell: level comes from the xp_events
+  // ledger via useXp(), and the picture from `users.avatar_path` via useAuth().avatarUrl,
+  // both resolved inside TopBar/SettingsPanel. They survive only for the Sidebar's demo
+  // squad roster (PEOPLE), which is still fixture data.
   const user: Person = useMemo(() => {
     const demo = getCurrentUser();
     if (!profile) return { ...demo, accent };

@@ -56,7 +56,12 @@ LEFT JOIN LATERAL (
               ELSE (SELECT status FROM public.goals       WHERE id = x.source_id) END AS status
 ) src ON true
 GROUP BY u.id, u.username
-ORDER BY orphaned_xp + stale_xp DESC;
+-- Repeats the two aggregates rather than naming the output columns: an output name is
+-- only resolvable in ORDER BY when it stands alone, and inside an expression Postgres
+-- looks for an *input* column called orphaned_xp, which does not exist (42703).
+ORDER BY coalesce(sum(x.amount) FILTER (WHERE src.status IS NULL), 0)
+       + coalesce(sum(x.amount) FILTER (WHERE src.status IS NOT NULL
+                                          AND src.status <> 'completed'), 0) DESC;
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 2. THE RECONCILIATION
